@@ -7,13 +7,16 @@ import express from 'express'
 import { rateLimit } from 'express-rate-limit'
 import helmet from 'helmet'
 import nodemailer from 'nodemailer'
+import pg from 'pg'
 
 const app = express()
-const port = Number(process.env.API_PORT || 3001)
+const port = Number(process.env.PORT || process.env.API_PORT || 3001)
+const host = process.env.HOST || (process.env.NODE_ENV === 'production' ? '0.0.0.0' : '127.0.0.1')
 const appUrl = process.env.APP_URL || 'http://127.0.0.1:5173'
 const allowedOrigins = new Set((process.env.APP_ORIGINS || 'http://127.0.0.1:5173,http://localhost:5173').split(',').map((origin) => origin.trim()))
 const sessionSecret = process.env.AUTH_SESSION_SECRET || (process.env.NODE_ENV === 'production' ? '' : crypto.randomBytes(32).toString('hex'))
 const storePath = resolve('data/auth-store.json')
+const database = process.env.DATABASE_URL ? new pg.Pool({ connectionString: process.env.DATABASE_URL, max: 5 }) : null
 const sessionCookie = 'youtopic_session'
 const trustedDeviceCookie = 'youtopic_trusted_device'
 const pendingDeviceCookie = 'youtopic_pending_device'
@@ -28,6 +31,8 @@ const scrypt = promisify(crypto.scrypt)
 let storeQueue = Promise.resolve()
 
 if (!sessionSecret) throw new Error('AUTH_SESSION_SECRET is required in production.')
+if (process.env.NODE_ENV === 'production' && !database) throw new Error('DATABASE_URL is required in production.')
+database?.on('error', (error) => console.error('PostgreSQL connection error:', error))
 
 function isAllowedOrigin(origin) {
   if (allowedOrigins.has(origin)) return true
@@ -55,6 +60,7 @@ const mailer = process.env.SMTP_URL ? nodemailer.createTransport(process.env.SMT
 
 app.disable('x-powered-by')
 app.use(helmet({ crossOriginEmbedderPolicy: false }))
+if (process.env.NODE_ENV === 'production') app.set('trust proxy', 1)
 app.use(express.json({ limit: '2mb' }))
 const authRateLimit = rateLimit({ windowMs: 15 * 60 * 1000, limit: 12, standardHeaders: true, legacyHeaders: false })
 app.use('/api', (request, response, next) => {
@@ -68,7 +74,25 @@ function emptyStore() {
   return { users: [] }
 }
 
+async function initializeDatabase() {
+  if (!database) return
+  await database.query(`
+    CREATE TABLE IF NOT EXISTS youtopic_auth_store (
+      id SMALLINT PRIMARY KEY CHECK (id = 1),
+      state JSONB NOT NULL
+    )
+  `)
+  await database.query(
+    'INSERT INTO youtopic_auth_store (id, state) VALUES (1, $1::jsonb) ON CONFLICT (id) DO NOTHING',
+    [JSON.stringify(emptyStore())],
+  )
+}
+
 async function readStore() {
+  if (database) {
+    const { rows } = await database.query('SELECT state FROM youtopic_auth_store WHERE id = 1')
+    return rows[0]?.state ?? emptyStore()
+  }
   try {
     return JSON.parse(await readFile(storePath, 'utf8'))
   } catch (error) {
@@ -78,6 +102,28 @@ async function readStore() {
 }
 
 function updateStore(update) {
+  if (database) {
+    return database.connect().then(async (client) => {
+      try {
+        await client.query('BEGIN')
+        const { rows } = await client.query('SELECT state FROM youtopic_auth_store WHERE id = 1 FOR UPDATE')
+        const store = rows[0]?.state ?? emptyStore()
+        const result = await update(store)
+        await client.query('UPDATE youtopic_auth_store SET state = $1::jsonb WHERE id = 1', [JSON.stringify(store)])
+        await client.query('COMMIT')
+        return result
+      } catch (error) {
+        try {
+          await client.query('ROLLBACK')
+        } catch (rollbackError) {
+          console.error('Auth store transaction rollback failed:', rollbackError)
+        }
+        throw error
+      } finally {
+        client.release()
+      }
+    })
+  }
   const operation = storeQueue.then(async () => {
     const store = await readStore()
     const result = await update(store)
@@ -674,4 +720,5 @@ app.use((error, _request, response, _next) => {
   return response.status(500).json({ error: 'Wystąpił błąd serwera.' })
 })
 
-app.listen(port, '127.0.0.1', () => console.log(`YouTopic API listening on http://127.0.0.1:${port}`))
+await initializeDatabase()
+app.listen(port, host, () => console.log(`YouTopic API listening on http://${host}:${port}`))
