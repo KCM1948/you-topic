@@ -1,0 +1,63 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "YouTopic: install dependencies",
+			"type": "shell",
+			"command": "npm.cmd",
+			"args": [
+				"install"
+			],
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "YouTopic: production build",
+			"type": "shell",
+			"command": "npm.cmd",
+			"args": [
+				"run",
+				"build"
+			],
+			"isBackground": false,
+			"problemMatcher": [
+				"$tsc"
+			]
+		},
+		{
+			"label": "YouTopic: start dev server",
+			"type": "shell",
+			"command": "npm.cmd",
+			"args": [
+				"run",
+				"dev"
+			],
+			"isBackground": true,
+			"problemMatcher": []
+		},
+		{
+			"label": "YouTopic: dependency audit",
+			"type": "shell",
+			"command": "npm.cmd",
+			"args": [
+				"audit"
+			],
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "YouTopic: package test ZIP",
+			"type": "shell",
+			"command": "Compress-Archive",
+			"args": [
+				"-Path",
+				"src,public,server,.github,.vscode,index.html,package.json,package-lock.json,vite.config.ts,tsconfig.json,tsconfig.app.json,tsconfig.node.json,README.md,.gitignore,.env.example",
+				"-DestinationPath",
+				"YouTopic-test.zip",
+				"-Force"
+			],
+			"isBackground": false,
+			"problemMatcher": []
+		}
+	]
+}
