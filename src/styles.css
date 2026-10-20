@@ -29,6 +29,11 @@ button { cursor: pointer; }
 .brand-accent { color: #4c7747; }
 .brand-mark { display: block; width: 31px; height: 31px; transition: transform .2s ease; }
 .brand:hover .brand-mark { transform: rotate(-6deg); }
+.beta-badge { align-self: center; padding: 3px 6px; border: 1px solid #d4e1c7; border-radius: 5px; background: #edf4e7; color: #476a3d; font-size: 9px; font-weight: 800; letter-spacing: .5px; line-height: 1; text-transform: uppercase; }
+.auth-brand .beta-badge { border-color: #ffffff60; background: #ffffff18; color: #d8efb8; }
+.beta-announcement { display: flex; align-items: center; gap: 10px; padding: 11px 18px; border-bottom: 1px solid #dfe8d8; background: #f3f7ef; color: #53634d; font-size: 12px; line-height: 1.5; }
+.beta-announcement strong { flex: 0 0 auto; color: #345a37; font-size: 11px; letter-spacing: .2px; }
+.auth-form-wrap > .beta-announcement { margin-bottom: 24px; padding: 10px 12px; border: 1px solid #dfe8d8; border-radius: 6px; font-size: 11px; }
 .search-box { width: 100%; max-width: 500px; height: 40px; display: flex; align-items: center; gap: 10px; padding: 0 12px; border-radius: 7px; background: #f4f5f1; color: #7b8077; }
 .search-box input { min-width: 0; flex: 1; border: 0; outline: 0; background: transparent; color: var(--ink); font-size: 13px; }
 .search-box input::placeholder { color: #92968e; }
@@ -807,6 +812,9 @@ h1 { margin: 0; font-family: var(--font-display); font-size: 25px; line-height: 
   .chat-room-header { gap: 6px; padding-inline: 7px; }
   .chat-room-header .outside-badge { padding: 5px; font-size: 7px; }
   .room-invitation-banner, .room-invitation-status { padding: 7px; font-size: 8px; }
+  .beta-badge { padding: 3px 5px; font-size: 8px; }
+  .beta-announcement { align-items: flex-start; gap: 7px; padding: 9px 14px; font-size: 10px; }
+  .auth-form-wrap > .beta-announcement { margin-bottom: 20px; padding: 9px 10px; }
   .room-invitation-banner button { min-height: 25px; padding-inline: 6px; font-size: 8px; }
   .chat-room-messages { padding: 10px 8px; }
   .room-actions { padding-inline: 8px; }

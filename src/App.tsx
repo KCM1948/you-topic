@@ -1372,6 +1372,7 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
 
           {isBandView && band && !isCreatingBand && <>
             <section className="band-banner">
+          <span className="beta-badge">beta</span>
               <div className="band-banner-icon"><LockKeyhole size={20} /></div>
               <div className="band-banner-copy"><span>PRYWATNA BANDA</span><h2>{band.name}</h2><p>Tylko Ty i zaproszeni ekipowicze widzicie tę tablicę.</p></div>
               <div className="band-banner-actions">
@@ -1388,6 +1389,10 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
             <section className="band-stories" aria-label="Relacje członków bandy">
               <div className="band-stories-heading"><span>RELACJE BANDY</span><small>Znikają po 24 godzinach</small></div>
               <div className="band-story-list">
+      <aside className="beta-announcement" role="note">
+        <strong>Wersja beta</strong>
+        <span>Testujemy YouTopic — część funkcji może działać niekompletnie. Dziękujemy za zgłaszanie uwag.</span>
+      </aside>
                 <button className="band-story band-story-create" onClick={() => storyTextInput.current?.focus()}>
                   <span className="band-story-ring"><img src={currentUser.avatar} alt="" /><i><Plus size={13} /></i></span><span>Twoja relacja</span>
                 </button>
@@ -1948,6 +1953,7 @@ function TopikiVideo({ src, autoAdvance, onAutoAdvanceChange, onEnded }: { src: 
       manuallyPausedRef.current = true
       video.pause()
     }
+        <span className="beta-badge">beta</span>
   }
 
   return <div
@@ -1958,6 +1964,10 @@ function TopikiVideo({ src, autoAdvance, onAutoAdvanceChange, onEnded }: { src: 
     onPointerEnter={(event) => {
       if (event.pointerType === 'mouse') setIsTouchControlsVisible(true)
     }}
+        <aside className="beta-announcement" role="note">
+          <strong>Wersja beta</strong>
+          <span>Serwis jest w fazie testów. Możesz napotkać błędy lub niepełne funkcje.</span>
+        </aside>
     onPointerLeave={(event) => {
       if (event.pointerType === 'mouse') setIsTouchControlsVisible(false)
     }}
