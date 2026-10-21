@@ -83,7 +83,7 @@ app.use('/api', (request, response, next) => {
 })
 
 function emptyStore() {
-  return { users: [], announcements: [], admins: [], rankPermissionTemplates: {}, reports: [], reportNotifications: [], moderatedItems: [], supportTickets: [], auditLog: [], platformSettings: { registrationEnabled: true }, deletedUsers: [], ipBlocks: [], socialPosts: [], socialMedia: [], socialCrewLinks: [], socialCrewInvitations: [] }
+  return { users: [], announcements: [], admins: [], rankPermissionTemplates: {}, reports: [], reportNotifications: [], socialNotifications: [], socialChatMessages: [], socialBands: [], moderatedItems: [], supportTickets: [], auditLog: [], platformSettings: { registrationEnabled: true }, deletedUsers: [], ipBlocks: [], socialPosts: [], socialMedia: [], socialCrewLinks: [], socialCrewInvitations: [] }
 }
 
 function normalizeStore(store) {
@@ -121,6 +121,9 @@ function normalizeStore(store) {
     socialMedia: Array.isArray(store.socialMedia) ? store.socialMedia : [],
     socialCrewLinks: Array.isArray(store.socialCrewLinks) ? store.socialCrewLinks : [],
     socialCrewInvitations: Array.isArray(store.socialCrewInvitations) ? store.socialCrewInvitations : [],
+    socialNotifications: Array.isArray(store.socialNotifications) ? store.socialNotifications : [],
+    socialChatMessages: Array.isArray(store.socialChatMessages) ? store.socialChatMessages : [],
+    socialBands: Array.isArray(store.socialBands) ? store.socialBands : [],
   }
 }
 
@@ -151,10 +154,12 @@ async function initializeDatabase() {
       liked_by JSONB NOT NULL DEFAULT '[]'::jsonb,
       saved_by JSONB NOT NULL DEFAULT '[]'::jsonb,
       boosted_by JSONB NOT NULL DEFAULT '[]'::jsonb,
+      band_id TEXT,
       created_at BIGINT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS youtopic_social_comment_ids (id BIGSERIAL PRIMARY KEY);
   `)
+  await database.query('ALTER TABLE youtopic_social_posts ADD COLUMN IF NOT EXISTS band_id TEXT')
   await database.query("SELECT setval(pg_get_serial_sequence('youtopic_social_posts', 'id'), GREATEST(COALESCE((SELECT MAX(id) FROM youtopic_social_posts), 0), 1000000000))")
   await database.query("SELECT setval(pg_get_serial_sequence('youtopic_social_comment_ids', 'id'), GREATEST(COALESCE((SELECT MAX(id) FROM youtopic_social_comment_ids), 0), 1000000000))")
 }
@@ -442,6 +447,42 @@ function publicSocialPerson(user) {
   }
 }
 
+function isCrewMember(store, firstUserId, secondUserId) {
+  return store.socialCrewLinks.some((link) =>
+    (link.firstUserId === firstUserId && link.secondUserId === secondUserId)
+    || (link.firstUserId === secondUserId && link.secondUserId === firstUserId))
+}
+
+function bandForMember(store, bandId, userId) {
+  const band = store.socialBands.find((item) => item.id === bandId)
+  return band && (band.adminId === userId || band.memberIds.includes(userId)) ? band : null
+}
+
+function publicBand(band, users) {
+  const admin = users.find((user) => user.id === band.adminId)
+  return {
+    id: band.id,
+    name: band.name,
+    adminHandle: admin ? defaultNickname(admin) : '',
+    memberHandles: band.memberIds.map((id) => users.find((user) => user.id === id)).filter(Boolean).map(defaultNickname),
+  }
+}
+
+function appendSocialNotification(store, userId, actorId, type, message, postId) {
+  if (!userId || userId === actorId) return
+  store.socialNotifications.unshift({
+    id: crypto.randomUUID(),
+    userId,
+    actorId,
+    type,
+    message,
+    postId: postId ? String(postId) : undefined,
+    createdAt: Date.now(),
+    readAt: null,
+  })
+  store.socialNotifications = store.socialNotifications.slice(0, 5000)
+}
+
 function socialPostForUser(post, userId, users) {
   const author = users.find((user) => user.id === post.authorId)
   const likedBy = Array.isArray(post.likedBy) ? post.likedBy : []
@@ -478,8 +519,14 @@ function socialPostForUser(post, userId, users) {
 
 async function readSocialPosts(userId, store = null) {
   store ??= await readStore()
+  const accessibleBandIds = store.socialBands
+    .filter((band) => band.adminId === userId || band.memberIds.includes(userId))
+    .map((band) => band.id)
   if (database) {
-    const { rows } = await database.query('SELECT id, author_id, data, liked_by, saved_by, boosted_by FROM youtopic_social_posts ORDER BY created_at DESC, id DESC LIMIT 200')
+    const { rows } = await database.query(
+      'SELECT id, author_id, data, liked_by, saved_by, boosted_by FROM youtopic_social_posts WHERE band_id IS NULL OR band_id = ANY($1::text[]) ORDER BY created_at DESC, id DESC LIMIT 300',
+      [accessibleBandIds],
+    )
     return rows.map((row) => socialPostForUser({
       id: row.id,
       authorId: row.author_id,
@@ -491,7 +538,9 @@ async function readSocialPosts(userId, store = null) {
       author: row.data.author,
     }, userId, store.users))
   }
-  return store.socialPosts.map((post) => socialPostForUser(post, userId, store.users))
+  return store.socialPosts
+    .filter((post) => !post.data.bandId || accessibleBandIds.includes(post.data.bandId))
+    .map((post) => socialPostForUser(post, userId, store.users))
 }
 
 async function readMedia(mediaId, ownerId, allowPublished = false) {
@@ -505,21 +554,39 @@ async function readMedia(mediaId, ownerId, allowPublished = false) {
     const { rows: references } = await database.query(`
       SELECT 1
       FROM youtopic_social_posts
-      WHERE data->>'image' = $1 OR data->>'video' = $1
+      WHERE band_id IS NULL AND (data->>'image' = $1 OR data->>'video' = $1
+        OR EXISTS (
+          SELECT 1 FROM jsonb_array_elements(COALESCE(data->'comments', '[]'::jsonb)) AS comment
+          WHERE comment->>'audioUrl' = $1
+        ))
+      LIMIT 1
+    `, [mediaUrl])
+    if (references.length) return media
+    const { rows: bandReferences } = await database.query(`
+      SELECT band_id
+      FROM youtopic_social_posts
+      WHERE band_id IS NOT NULL AND (
+        data->>'image' = $1 OR data->>'video' = $1
         OR EXISTS (
           SELECT 1 FROM jsonb_array_elements(COALESCE(data->'comments', '[]'::jsonb)) AS comment
           WHERE comment->>'audioUrl' = $1
         )
-      LIMIT 1
+      )
+      LIMIT 20
     `, [mediaUrl])
-    return references.length ? media : null
+    if (!bandReferences.length) return null
+    const store = await readStore()
+    return bandReferences.some(({ band_id }) => bandForMember(store, band_id, ownerId)) ? media : null
   }
   const store = await readStore()
   const media = store.socialMedia.find((item) => item.id === mediaId && item.ownerId === ownerId)
   if (media) return { content_type: media.contentType, data: Buffer.from(media.data, 'base64') }
   if (!allowPublished) return null
   const mediaUrl = `/api/media/${mediaId}`
-  const isPublished = store.socialPosts.some((post) => post.data.image === mediaUrl || post.data.video === mediaUrl || post.comments.some((comment) => comment.audioUrl === mediaUrl))
+  const isPublished = store.socialPosts.some((post) => {
+    const referencesMedia = post.data.image === mediaUrl || post.data.video === mediaUrl || post.comments.some((comment) => comment.audioUrl === mediaUrl)
+    return referencesMedia && (!post.data.bandId || bandForMember(store, post.data.bandId, ownerId))
+  })
   const publishedMedia = isPublished ? store.socialMedia.find((item) => item.id === mediaId) : null
   return publishedMedia ? { content_type: publishedMedia.contentType, data: Buffer.from(publishedMedia.data, 'base64') } : null
 }
@@ -558,7 +625,26 @@ app.get('/api/media/:mediaId', requireAuthentication, async (request, response) 
   if (!/^[\da-f-]{36}$/i.test(request.params.mediaId)) return response.status(404).json({ error: 'Nie znaleziono pliku.' })
   const media = await readMedia(request.params.mediaId, request.authUser.id, true)
   if (!media) return response.status(404).json({ error: 'Nie znaleziono pliku.' })
-  response.set({ 'Content-Type': media.content_type, 'Content-Length': String(media.data.length), 'Cache-Control': 'private, max-age=3600', 'X-Content-Type-Options': 'nosniff' })
+  const baseHeaders = { 'Content-Type': media.content_type, 'Accept-Ranges': 'bytes', 'Cache-Control': 'private, max-age=3600', 'X-Content-Type-Options': 'nosniff' }
+  const range = request.get('range')
+  if (range && /^video\//.test(media.content_type)) {
+    const match = /^bytes=(\d*)-(\d*)$/.exec(range)
+    if (!match || (!match[1] && !match[2])) {
+      response.set({ ...baseHeaders, 'Content-Range': `bytes */${media.data.length}` })
+      return response.status(416).end()
+    }
+    const suffixLength = match[1] ? null : Number(match[2])
+    const start = match[1] ? Number(match[1]) : Math.max(0, media.data.length - (suffixLength || 0))
+    const end = match[2] && match[1] ? Math.min(Number(match[2]), media.data.length - 1) : media.data.length - 1
+    if (start >= media.data.length || end < start) {
+      response.set({ ...baseHeaders, 'Content-Range': `bytes */${media.data.length}` })
+      return response.status(416).end()
+    }
+    const chunk = media.data.subarray(start, end + 1)
+    response.set({ ...baseHeaders, 'Content-Length': String(chunk.length), 'Content-Range': `bytes ${start}-${end}/${media.data.length}` })
+    return response.status(206).send(chunk)
+  }
+  response.set({ ...baseHeaders, 'Content-Length': String(media.data.length) })
   return response.send(media.data)
 })
 
@@ -610,6 +696,7 @@ app.post('/api/crew/invitations', requireAuthentication, crewMutationLimit, asyn
     if (pending) return { error: 'Zaproszenie do Ekipy już czeka na odpowiedź.' }
     const invitation = { id: crypto.randomUUID(), fromId: request.authUser.id, toId: target.id, status: 'pending', createdAt: Date.now() }
     store.socialCrewInvitations.push(invitation)
+    appendSocialNotification(store, target.id, request.authUser.id, 'crew_invitation', 'zaprasza Cię do swojej Ekipy.')
     return { invitation: { ...invitation, from: publicSocialPerson(request.authUser), to: publicSocialPerson(target) } }
   })
   if (result.error) return response.status(409).json({ error: result.error })
@@ -624,6 +711,7 @@ app.post('/api/crew/invitations/:invitationId/respond', requireAuthentication, c
     if (!invitation) return { error: 'To zaproszenie nie jest już dostępne.' }
     invitation.status = accept ? 'accepted' : 'declined'
     invitation.respondedAt = Date.now()
+    if (accept) appendSocialNotification(store, invitation.fromId, request.authUser.id, 'crew_accepted', 'zaakceptował Twoje zaproszenie do Ekipy.')
     if (accept && !store.socialCrewLinks.some((link) =>
       [link.firstUserId, link.secondUserId].sort().join(':') === [invitation.fromId, invitation.toId].sort().join(':'))) {
       store.socialCrewLinks.push({ firstUserId: invitation.fromId, secondUserId: invitation.toId })
@@ -660,6 +748,152 @@ app.delete('/api/crew/:handle', requireAuthentication, crewMutationLimit, async 
   return response.json(result)
 })
 
+app.get('/api/bands', requireAuthentication, socialDirectoryLimit, async (request, response) => {
+  const store = request.authStore
+  const bands = store.socialBands
+    .filter((band) => band.adminId === request.authUser.id || band.memberIds.includes(request.authUser.id))
+    .map((band) => publicBand(band, store.users))
+  return response.json({ bands })
+})
+
+app.post('/api/bands', requireAuthentication, crewMutationLimit, async (request, response) => {
+  const name = typeof request.body?.name === 'string' ? request.body.name.trim().slice(0, 60) : ''
+  const memberHandles = Array.isArray(request.body?.memberHandles) ? request.body.memberHandles.filter((handle) => typeof handle === 'string') : []
+  if (!name) return response.status(400).json({ error: 'Podaj nazwę bandy.' })
+  const result = await updateStore((store) => {
+    const requestedMembers = store.users.filter((user) => memberHandles.includes(defaultNickname(user)))
+    if (requestedMembers.length !== new Set(memberHandles).size
+      || requestedMembers.some((user) => !isCrewMember(store, request.authUser.id, user.id))) {
+      return { error: 'Do bandy możesz zaprosić tylko osoby ze swojej Ekipy.' }
+    }
+    const band = {
+      id: crypto.randomUUID(),
+      name,
+      adminId: request.authUser.id,
+      memberIds: [...new Set(requestedMembers.map((user) => user.id))],
+      createdAt: Date.now(),
+    }
+    store.socialBands.push(band)
+    return { band: publicBand(band, store.users) }
+  })
+  if (result.error) return response.status(400).json({ error: result.error })
+  return response.status(201).json(result)
+})
+
+app.patch('/api/bands/:bandId/members', requireAuthentication, crewMutationLimit, async (request, response) => {
+  const userId = typeof request.body?.userId === 'string' ? request.body.userId : ''
+  const member = request.body?.member
+  if (!userId || userId === request.authUser.id || typeof member !== 'boolean') {
+    return response.status(400).json({ error: 'Nieprawidłowa zmiana składu bandy.' })
+  }
+  const result = await updateStore((store) => {
+    const band = store.socialBands.find((item) => item.id === request.params.bandId && item.adminId === request.authUser.id)
+    const user = store.users.find((item) => item.id === userId)
+    if (!band || !user) return { error: 'Nie znaleziono bandy lub użytkownika.' }
+    if (member && !isCrewMember(store, request.authUser.id, userId)) return { error: 'Do bandy możesz dodać tylko osobę ze swojej Ekipy.' }
+    band.memberIds = member
+      ? [...new Set([...band.memberIds, userId])]
+      : band.memberIds.filter((id) => id !== userId)
+    return { band: publicBand(band, store.users) }
+  })
+  if (result.error) return response.status(404).json({ error: result.error })
+  return response.json(result)
+})
+
+app.get('/api/notifications', requireAuthentication, async (request, response) => {
+  const store = request.authStore
+  const usersById = new Map(store.users.map((user) => [user.id, user]))
+  const notifications = store.socialNotifications
+    .filter((item) => item.userId === request.authUser.id)
+    .sort((first, second) => second.createdAt - first.createdAt)
+    .slice(0, 100)
+    .map(({ id, actorId, type, message, postId, createdAt, readAt }) => ({
+      id, actor: usersById.has(actorId) ? publicSocialPerson(usersById.get(actorId)) : null,
+      type, message, postId, createdAt, readAt,
+    }))
+  response.set('Cache-Control', 'no-store')
+  return response.json({ notifications })
+})
+
+app.patch('/api/notifications/read', requireAuthentication, async (request, response) => {
+  const id = typeof request.body?.id === 'string' ? request.body.id : ''
+  const now = Date.now()
+  await updateStore((store) => {
+    for (const notification of store.socialNotifications) {
+      if (notification.userId === request.authUser.id && (!id || notification.id === id)) notification.readAt ??= now
+    }
+  })
+  return response.json({ ok: true })
+})
+
+const chatMutationLimit = rateLimit({ windowMs: 60 * 1000, limit: 60, standardHeaders: true, legacyHeaders: false })
+
+app.get('/api/chat', requireAuthentication, socialDirectoryLimit, async (request, response) => {
+  if (request.query.scope !== undefined && !['public', 'room'].includes(request.query.scope)) return response.status(400).json({ error: 'Nieprawidłowy rodzaj rozmowy.' })
+  const scope = request.query.scope === 'room' ? 'room' : 'public'
+  response.set('Cache-Control', 'no-store')
+  const store = request.authStore
+  const recipientHandle = typeof request.query.with === 'string' ? request.query.with : ''
+  const recipient = scope === 'room' ? store.users.find((user) => defaultNickname(user) === recipientHandle) : null
+  if (scope === 'room' && (!recipient || !isCrewMember(store, request.authUser.id, recipient.id))) {
+    return response.status(403).json({ error: 'Prywatny czat jest dostępny po zaakceptowaniu zaproszenia do Ekipy.' })
+  }
+  const messages = store.socialChatMessages
+    .filter((item) => store.users.some((user) => user.id === item.authorId)
+      && (scope !== 'room' || store.users.some((user) => user.id === item.recipientId))
+      && item.scope === scope && (scope === 'public'
+      || ((item.authorId === request.authUser.id && item.recipientId === recipient.id)
+        || (item.authorId === recipient.id && item.recipientId === request.authUser.id))))
+    .slice(-200)
+    .map((item) => ({
+      id: item.id,
+      author: publicSocialPerson(store.users.find((user) => user.id === item.authorId)),
+      scope: item.scope,
+      recipientHandle: item.recipientId ? defaultNickname(store.users.find((user) => user.id === item.recipientId)) : undefined,
+      text: item.text,
+      time: new Intl.DateTimeFormat('pl-PL', { hour: '2-digit', minute: '2-digit' }).format(item.createdAt),
+      createdAt: item.createdAt,
+    }))
+  return response.json({ messages })
+})
+
+app.post('/api/chat', requireAuthentication, chatMutationLimit, async (request, response) => {
+  if (request.body?.scope !== undefined && !['public', 'room'].includes(request.body.scope)) return response.status(400).json({ error: 'Nieprawidłowy rodzaj rozmowy.' })
+  const scope = request.body?.scope === 'room' ? 'room' : 'public'
+  const text = typeof request.body?.text === 'string' ? request.body.text.trim() : ''
+  const recipientHandle = typeof request.body?.with === 'string' ? request.body.with : ''
+  if (!text || text.length > 2000) return response.status(400).json({ error: 'Wiadomość musi mieć od 1 do 2000 znaków.' })
+  const result = await updateStore((store) => {
+    const recipient = scope === 'room' ? store.users.find((user) => defaultNickname(user) === recipientHandle) : null
+    if (scope === 'room' && (!recipient || !isCrewMember(store, request.authUser.id, recipient.id))) {
+      return { error: 'Prywatny czat jest dostępny po zaakceptowaniu zaproszenia do Ekipy.', status: 403 }
+    }
+    const message = {
+      id: crypto.randomUUID(),
+      authorId: request.authUser.id,
+      recipientId: recipient?.id,
+      scope,
+      text,
+      createdAt: Date.now(),
+    }
+    store.socialChatMessages.push(message)
+    store.socialChatMessages = store.socialChatMessages.slice(-5000)
+    return {
+      message: {
+        id: message.id,
+        author: publicSocialPerson(request.authUser),
+        scope,
+        recipientHandle: recipient ? defaultNickname(recipient) : undefined,
+        text,
+        time: new Intl.DateTimeFormat('pl-PL', { hour: '2-digit', minute: '2-digit' }).format(message.createdAt),
+        createdAt: message.createdAt,
+      },
+    }
+  })
+  if (result.error) return response.status(result.status).json({ error: result.error })
+  return response.status(201).json(result)
+})
+
 app.delete('/api/media/:mediaId', requireAuthentication, async (request, response) => {
   const mediaId = request.params.mediaId
   if (!/^[\da-f-]{36}$/i.test(mediaId)) return response.status(404).json({ error: 'Nie znaleziono pliku.' })
@@ -692,22 +926,38 @@ app.delete('/api/media/:mediaId', requireAuthentication, async (request, respons
 })
 
 app.get('/api/posts', requireAuthentication, async (request, response) => {
+  response.set('Cache-Control', 'no-store')
   return response.json({ posts: await readSocialPosts(request.authUser.id, request.authStore) })
 })
 
 app.post('/api/posts', requireAuthentication, postCreationLimit, async (request, response) => {
   const { topic, text, imageMediaId, videoMediaId, externalUrl } = request.body ?? {}
-  const normalizedTopic = typeof topic === 'string' ? topic.trim().replace(/^#+\s*/, '').slice(0, 80) : ''
-  const normalizedText = typeof text === 'string' ? text.trim() : ''
-  if (!normalizedTopic || normalizedText.length > 5000 || (!normalizedText && !imageMediaId && !videoMediaId && !externalUrl)) return response.status(400).json({ error: 'Podaj temat i treść posta albo dodaj zdjęcie lub film.' })
+  const bandId = typeof request.body?.bandId === 'string' ? request.body.bandId : ''
+  const sharedPostId = typeof request.body?.sharedPostId === 'string' ? request.body.sharedPostId : ''
+  let sharedSource = null
+  if (bandId && !bandForMember(request.authStore, bandId, request.authUser.id)) return response.status(403).json({ error: 'Nie należysz do tej bandy.' })
+  if (sharedPostId && bandId) {
+    if (database) {
+      const { rows } = await database.query('SELECT id, author_id, data FROM youtopic_social_posts WHERE id = $1 AND band_id IS NULL', [sharedPostId])
+      sharedSource = rows[0] ? { id: rows[0].id, authorId: rows[0].author_id, data: rows[0].data } : null
+    } else {
+      const source = request.authStore.socialPosts.find((post) => String(post.id) === sharedPostId && !post.data.bandId)
+      sharedSource = source ? { id: source.id, authorId: source.authorId, data: source.data } : null
+    }
+    if (!sharedSource) return response.status(404).json({ error: 'Nie znaleziono publicznego posta do udostępnienia.' })
+  }
+  const normalizedTopic = sharedSource?.data.topic ?? (typeof topic === 'string' ? topic.trim().replace(/^#+\s*/, '').slice(0, 80) : '')
+  const normalizedText = sharedSource?.data.text ?? (typeof text === 'string' ? text.trim() : '')
+  if (!normalizedTopic || normalizedText.length > 5000 || (!normalizedText && !imageMediaId && !videoMediaId && !externalUrl && !sharedSource?.data.image && !sharedSource?.data.video)) return response.status(400).json({ error: 'Podaj temat i treść posta albo dodaj zdjęcie lub film.' })
   if (imageMediaId && videoMediaId) return response.status(400).json({ error: 'Do jednego posta dodaj zdjęcie albo film.' })
-  for (const [mediaId, expectedPrefix] of [[imageMediaId, 'image/'], [videoMediaId, 'video/']]) {
+  for (const [mediaId, expectedPrefix] of sharedSource ? [] : [[imageMediaId, 'image/'], [videoMediaId, 'video/']]) {
     if (!mediaId) continue
     const media = await readMedia(mediaId, request.authUser.id)
     if (!media || !media.content_type.startsWith(expectedPrefix)) return response.status(400).json({ error: 'Nie znaleziono przesłanego pliku. Dodaj go ponownie.' })
   }
   let normalizedUrl
-  if (externalUrl) {
+  if (sharedSource) normalizedUrl = sharedSource.data.externalUrl
+  else if (externalUrl) {
     try {
       const parsed = new URL(externalUrl)
       if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('invalid protocol')
@@ -718,17 +968,30 @@ app.post('/api/posts', requireAuthentication, postCreationLimit, async (request,
   }
   const author = publicSocialPerson(request.authUser)
   const now = Date.now()
+  const postData = {
+    author,
+    time: 'teraz',
+    topic: normalizedTopic.toLocaleUpperCase('pl-PL'),
+    text: normalizedText,
+    image: sharedSource?.data.image ?? (imageMediaId ? `/api/media/${imageMediaId}` : undefined),
+    video: sharedSource?.data.video ?? (videoMediaId ? `/api/media/${videoMediaId}` : undefined),
+    externalUrl: normalizedUrl,
+    comments: [],
+    boosts: 0,
+    bandId: bandId || undefined,
+    sharedFrom: sharedSource ? { author: sharedSource.data.author, topic: sharedSource.data.topic, postId: Number(sharedSource.id) } : undefined,
+  }
   if (database) {
     const { rows } = await database.query(
-      `INSERT INTO youtopic_social_posts (author_id, data, created_at)
-       VALUES ($1, $2::jsonb, $3)
+      `INSERT INTO youtopic_social_posts (author_id, data, band_id, created_at)
+       VALUES ($1, $2::jsonb, $3, $4)
        RETURNING id, author_id, data, liked_by, saved_by, boosted_by`,
-      [request.authUser.id, JSON.stringify({ author, time: 'teraz', topic: normalizedTopic.toLocaleUpperCase('pl-PL'), text: normalizedText, image: imageMediaId ? `/api/media/${imageMediaId}` : undefined, video: videoMediaId ? `/api/media/${videoMediaId}` : undefined, externalUrl: normalizedUrl, comments: [], boosts: 0 }), now],
+      [request.authUser.id, JSON.stringify(postData), bandId || null, now],
     )
     return response.status(201).json({ post: socialPostForUser({ ...rows[0], comments: rows[0].data.comments ?? [] }, request.authUser.id, (await readStore()).users) })
   }
   const post = await updateStore((store) => {
-    const created = { id: Date.now(), authorId: request.authUser.id, author, data: { author, time: 'teraz', topic: normalizedTopic.toLocaleUpperCase('pl-PL'), text: normalizedText, image: imageMediaId ? `/api/media/${imageMediaId}` : undefined, video: videoMediaId ? `/api/media/${videoMediaId}` : undefined, externalUrl: normalizedUrl, comments: [], boosts: 0 }, comments: [], likedBy: [], savedBy: [], boostedBy: [] }
+    const created = { id: Date.now(), authorId: request.authUser.id, author, data: postData, comments: [], likedBy: [], savedBy: [], boostedBy: [] }
     store.socialPosts.unshift(created)
     return socialPostForUser(created, request.authUser.id, store.users)
   })
@@ -738,15 +1001,20 @@ app.post('/api/posts', requireAuthentication, postCreationLimit, async (request,
 async function mutateSocialPost(postId, userId, mutate) {
   if (!/^\d+$/.test(postId)) return null
   if (database) {
+    const store = await readStore()
     const client = await database.connect()
     try {
       await client.query('BEGIN')
-      const { rows } = await client.query('SELECT id, author_id, data, liked_by, saved_by, boosted_by FROM youtopic_social_posts WHERE id = $1 FOR UPDATE', [postId])
+      const { rows } = await client.query('SELECT id, author_id, data, liked_by, saved_by, boosted_by, band_id FROM youtopic_social_posts WHERE id = $1 FOR UPDATE', [postId])
       if (!rows[0]) {
         await client.query('ROLLBACK')
         return null
       }
       const row = rows[0]
+      if (row.band_id && !bandForMember(store, row.band_id, userId)) {
+        await client.query('ROLLBACK')
+        return null
+      }
       const post = { id: row.id, authorId: row.author_id, data: row.data, comments: row.data.comments ?? [], likedBy: row.liked_by, savedBy: row.saved_by, boostedBy: row.boosted_by }
       const result = await mutate(post, client)
       if (result?.error) {
@@ -766,7 +1034,7 @@ async function mutateSocialPost(postId, userId, mutate) {
   }
   return updateStore(async (store) => {
     const item = store.socialPosts.find((entry) => String(entry.id) === postId)
-    if (!item) return null
+    if (!item || item.data.bandId && !bandForMember(store, item.data.bandId, userId)) return null
     const result = await mutate(item, null)
     if (result?.error) return { error: result.error }
     item.data.comments = item.comments
@@ -778,13 +1046,22 @@ async function socialPostResponse(postId, userId, response, mutate) {
   const updated = await mutateSocialPost(postId, userId, mutate)
   if (!updated) return response.status(404).json({ error: 'Nie znaleziono posta.' })
   if (updated.error) return response.status(400).json({ error: updated.error })
-  return response.json({ post: socialPostForUser(updated.post, userId, updated.users), ...updated.result && typeof updated.result === 'object' ? updated.result : {} })
+  const result = updated.result && typeof updated.result === 'object' ? { ...updated.result } : {}
+  const notification = result.notification
+  delete result.notification
+  if (notification) {
+    await updateStore((store) => appendSocialNotification(store, notification.userId, userId, notification.type, notification.message, postId))
+  }
+  return response.json({ post: socialPostForUser(updated.post, userId, updated.users), ...result })
 }
 
 app.post('/api/posts/:postId/like', requireAuthentication, async (request, response) => socialPostResponse(request.params.postId, request.authUser.id, response, (post) => {
   const index = post.likedBy.indexOf(request.authUser.id)
   if (index >= 0) post.likedBy.splice(index, 1)
-  else post.likedBy.push(request.authUser.id)
+  else {
+    post.likedBy.push(request.authUser.id)
+    return post.authorId === request.authUser.id ? undefined : { notification: { userId: post.authorId, type: 'like', message: 'polubił Twój post.' } }
+  }
 }))
 
 app.post('/api/posts/:postId/save', requireAuthentication, async (request, response) => socialPostResponse(request.params.postId, request.authUser.id, response, (post) => {
@@ -797,6 +1074,7 @@ app.post('/api/posts/:postId/boost', requireAuthentication, async (request, resp
   if (!post.boostedBy.includes(request.authUser.id)) {
     post.boostedBy.push(request.authUser.id)
     post.data.boosts = Number(post.data.boosts ?? 0) + 1
+    return post.authorId === request.authUser.id ? undefined : { notification: { userId: post.authorId, type: 'boost', message: 'podbił Twój post.' } }
   }
 }))
 
@@ -818,7 +1096,10 @@ app.post('/api/posts/:postId/comments', requireAuthentication, async (request, r
       id = Number(rows[0].id)
     } else id = Date.now()
     post.comments.push({ id, authorId: request.authUser.id, author: publicSocialPerson(request.authUser), text: text || undefined, audioUrl: audioMediaId ? `/api/media/${audioMediaId}` : undefined, audioType: audio?.content_type, replyToId, likes: 0, likedBy: [] })
-    return { commentId: id }
+    return {
+      commentId: id,
+      ...post.authorId === request.authUser.id ? {} : { notification: { userId: post.authorId, type: 'comment', message: 'skomentował Twój post.' } },
+    }
   }).then((result) => result)
 })
 
@@ -828,7 +1109,11 @@ app.post('/api/posts/:postId/comments/:commentId/like', requireAuthentication, a
   comment.likedBy ??= []
   const index = comment.likedBy.indexOf(request.authUser.id)
   if (index >= 0) comment.likedBy.splice(index, 1)
-  else comment.likedBy.push(request.authUser.id)
+  else {
+    comment.likedBy.push(request.authUser.id)
+    const commentAuthorId = comment.authorId
+    if (commentAuthorId && commentAuthorId !== request.authUser.id) return { notification: { userId: commentAuthorId, type: 'comment_like', message: 'polubił Twój komentarz.' } }
+  }
   comment.likes = comment.likedBy.length
 }))
 
