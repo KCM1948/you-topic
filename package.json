@@ -7,8 +7,10 @@
     "dev": "concurrently -k -n web,api -c green,blue \"npm:dev:client\" \"npm:dev:server\"",
     "dev:client": "vite --host 127.0.0.1",
     "dev:server": "node --watch server/index.js",
+    "dev:admin": "vite --config admin/vite.config.ts",
     "start:server": "node server/index.js",
     "build": "tsc -b && vite build",
+    "build:admin": "tsc -b && vite build --config admin/vite.config.ts",
     "preview": "vite preview"
   },
   "dependencies": {

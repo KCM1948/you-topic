@@ -1,6 +1,7 @@
 import { Fragment, useEffect, useMemo, useRef, useState, type ChangeEvent, type CSSProperties, type FormEvent } from 'react'
 import {
   Bookmark,
+  BadgeCheck,
   ArrowUp,
   Check,
   ChevronDown,
@@ -10,9 +11,11 @@ import {
   Compass,
   Copy,
   Eye,
+  Flag,
   Heart,
   Home,
   Image,
+  LifeBuoy,
   LockKeyhole,
   LogOut,
   MessageCircle,
@@ -36,6 +39,8 @@ import {
 } from 'lucide-react'
 
 type Person = {
+  id?: string
+  profileVerified?: boolean
   name: string
   firstName?: string
   middleName?: string
@@ -85,6 +90,7 @@ const defaultProfileVisibility: ProfileVisibilitySettings = {
 
 type Post = {
   id: number
+  serverBacked?: boolean
   author: Person
   time: string
   topic: string
@@ -111,12 +117,37 @@ type PostComment = {
   author: Person
   text?: string
   audioData?: string
+  audioUrl?: string
   audioType?: string
   audioDuration?: number
   likes?: number
   likedBy?: string[]
   replyToId?: number
   legacy?: boolean
+}
+
+type ReportNotification = {
+  id: string
+  targetType: string
+  message: string
+  createdAt: number
+}
+
+type ModeratedItem = {
+  targetType: string
+  targetId: string
+  targetUserId: string
+}
+
+function reportTypeName(targetType: string) {
+  return ({ profile: 'profil', post: 'post', photo: 'zdjęcie', video: 'wideo', comment: 'komentarz', message: 'wiadomość' } as Record<string, string>)[targetType] ?? 'treść'
+}
+
+type Announcement = {
+  id: string
+  title: string
+  message: string
+  createdAt: number
 }
 
 type Band = {
@@ -151,6 +182,7 @@ const storageKeys = {
   crewLinks: 'youtopic-crew-links',
   chatMessages: 'youtopic-chat-messages',
   crewInvitations: 'youtopic-crew-invitations',
+  dismissedAnnouncements: 'youtopic-dismissed-announcements',
 }
 
 function loadStored<T>(key: string, fallback: T): T {
@@ -190,7 +222,17 @@ type CrewInvitation = {
 
 type CrewLink = [string, string]
 
-type View = 'home' | 'explore' | 'topiki' | 'crew' | 'band' | 'notifications' | 'saved' | 'profile'
+type View = 'home' | 'explore' | 'topiki' | 'crew' | 'band' | 'notifications' | 'support' | 'saved' | 'profile'
+
+type SupportTicket = {
+  id: string
+  subject: string
+  category: 'account' | 'technical' | 'security' | 'idea' | 'other'
+  status: 'open' | 'in_progress' | 'resolved'
+  messages: Array<{ id: string; authorType: 'user' | 'admin'; authorName: string; message: string; createdAt: number }>
+  createdAt: number
+  updatedAt: number
+}
 
 const people: Person[] = [
   { name: 'Olek Wiśniewski', handle: 'olek.w', avatar: 'https://images.unsplash.com/photo-1500648767791-00dcc994a43e?w=100&h=100&fit=crop&crop=faces', gender: 'male', online: true, crewMembers: 214, crewSize: 75 },
@@ -328,6 +370,7 @@ const navItems: { id: View; label: string; icon: typeof Home }[] = [
   { id: 'crew', label: 'Ekipa', icon: UsersRound },
   { id: 'band', label: 'Banda', icon: LockKeyhole },
   { id: 'notifications', label: 'Powiadomienia', icon: Bell },
+  { id: 'support', label: 'Centrum pomocy', icon: LifeBuoy },
   { id: 'saved', label: 'Zapisane', icon: Bookmark },
 ]
 
@@ -387,23 +430,33 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
   const [personalStoryDraft, setPersonalStoryDraft] = useState('')
   const [personalStoryMedia, setPersonalStoryMedia] = useState('')
   const [personalStoryError, setPersonalStoryError] = useState('')
-  const [activeStoryId, setActiveStoryId] = useState<number | null>(null)
+  const [activeStoryKey, setActiveStoryKey] = useState<string | null>(null)
+  const [storyProgress, setStoryProgress] = useState(0)
   const [clockNow, setClockNow] = useState(Date.now())
   const [openViewers, setOpenViewers] = useState<number | null>(null)
   const [draft, setDraft] = useState('')
   const [draftTopic, setDraftTopic] = useState('')
   const [isChoosingDraftTopic, setIsChoosingDraftTopic] = useState(false)
-  const [media, setMedia] = useState<{ url: string; kind: 'image' | 'video'; name: string } | null>(null)
+  const [media, setMedia] = useState<{ url: string; kind: 'image' | 'video'; name: string; file: File } | null>(null)
   const [commentDraft, setCommentDraft] = useState<Record<number, string>>({})
   const [replyingTo, setReplyingTo] = useState<Record<number, PostComment | null>>({})
   const [recordingPostId, setRecordingPostId] = useState<number | null>(null)
   const [recordingSeconds, setRecordingSeconds] = useState(0)
-  const [voiceDraft, setVoiceDraft] = useState<{ postId: number; url: string; audioData: string; audioType: string; duration: number } | null>(null)
+  const [voiceDraft, setVoiceDraft] = useState<{ postId: number; url: string; audioData: string; audioType: string; duration: number; blob: Blob } | null>(null)
   const [openComments, setOpenComments] = useState<number[]>([])
   const [search, setSearch] = useState('')
   const [profile, setProfile] = useState<Person>(currentUser)
   const [profileBoostTarget, setProfileBoostTarget] = useState<Person | null>(null)
   const [notice, setNotice] = useState('')
+  const [announcements, setAnnouncements] = useState<Announcement[]>([])
+  const [reportNotifications, setReportNotifications] = useState<ReportNotification[]>([])
+  const [supportTickets, setSupportTickets] = useState<SupportTicket[]>([])
+  const [supportSubject, setSupportSubject] = useState('')
+  const [supportCategory, setSupportCategory] = useState<SupportTicket['category']>('account')
+  const [supportMessage, setSupportMessage] = useState('')
+  const [supportBusy, setSupportBusy] = useState(false)
+  const [moderatedItems, setModeratedItems] = useState<ModeratedItem[]>([])
+  const [dismissedAnnouncements, setDismissedAnnouncements] = useState<string[]>(() => loadStored<string[]>(storageKeys.dismissedAnnouncements, []))
   const [activeChatHandle, setActiveChatHandle] = useState('')
   const [chatMode, setChatMode] = useState<'public' | 'room'>('public')
   const [chatMessages, setChatMessages] = useState(() => loadStored<ChatMessage[]>(storageKeys.chatMessages, initialChatMessages))
@@ -440,6 +493,93 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
   const voiceChunksRef = useRef<Blob[]>([])
   const voiceStartedAtRef = useRef(0)
   const voiceCancelledRef = useRef(false)
+  const storyTouchStartXRef = useRef<number | null>(null)
+
+  useEffect(() => {
+    let active = true
+    const refreshAnnouncements = async () => {
+      try {
+        const response = await fetch('/api/announcements', { credentials: 'include', cache: 'no-store' })
+        const result = await response.json() as { announcements?: Announcement[]; error?: string }
+        if (!response.ok) throw new Error(result.error || 'Nie udało się pobrać komunikatów.')
+        if (active) setAnnouncements(result.announcements ?? [])
+      } catch (error: unknown) {
+        if (active) setNotice(error instanceof Error ? error.message : 'Nie udało się pobrać komunikatów.')
+      }
+    }
+    void refreshAnnouncements()
+    const refreshTimer = window.setInterval(() => { void refreshAnnouncements() }, 15_000)
+    const refreshOnFocus = () => { if (document.visibilityState === 'visible') void refreshAnnouncements() }
+    document.addEventListener('visibilitychange', refreshOnFocus)
+    window.addEventListener('focus', refreshOnFocus)
+    return () => {
+      active = false
+      window.clearInterval(refreshTimer)
+      document.removeEventListener('visibilitychange', refreshOnFocus)
+      window.removeEventListener('focus', refreshOnFocus)
+    }
+  }, [])
+
+  useEffect(() => {
+    let active = true
+    let hasLoaded = false
+    const refreshPosts = async () => {
+      try {
+        const { posts: remotePosts } = await authRequest<{ posts: Post[] }>('/api/posts')
+        if (!active) return
+        setPosts((current) => [...remotePosts, ...current.filter((post) => !post.serverBacked)])
+        hasLoaded = true
+      } catch (error: unknown) {
+        if (active && !hasLoaded) setNotice(error instanceof Error ? error.message : 'Nie udało się pobrać postów z serwera.')
+      }
+    }
+    void refreshPosts()
+    const timer = window.setInterval(() => { void refreshPosts() }, 15_000)
+    const refreshOnFocus = () => { if (document.visibilityState === 'visible') void refreshPosts() }
+    document.addEventListener('visibilitychange', refreshOnFocus)
+    window.addEventListener('focus', refreshOnFocus)
+    return () => {
+      active = false
+      window.clearInterval(timer)
+      document.removeEventListener('visibilitychange', refreshOnFocus)
+      window.removeEventListener('focus', refreshOnFocus)
+    }
+  }, [currentUser.id])
+
+  useEffect(() => {
+    if (view !== 'support') return
+    let active = true
+    authRequest<{ tickets: SupportTicket[] }>('/api/support/tickets')
+      .then(({ tickets }) => { if (active) setSupportTickets(tickets) })
+      .catch((error: unknown) => {
+        if (active) setNotice(error instanceof Error ? error.message : 'Nie udało się pobrać spraw pomocy.')
+      })
+    return () => { active = false }
+  }, [view])
+
+  useEffect(() => {
+    let active = true
+    const refreshModeration = async () => {
+      try {
+        const [notificationResult, moderatedResult] = await Promise.all([
+          authRequest<{ notifications: ReportNotification[] }>('/api/report-notifications'),
+          authRequest<{ items: ModeratedItem[] }>('/api/moderation/removed-content'),
+        ])
+        if (active) {
+          setReportNotifications(notificationResult.notifications)
+          setModeratedItems(moderatedResult.items)
+        }
+      } catch (moderationError) {
+        if (active) setNotice(moderationError instanceof Error ? moderationError.message : 'Nie udało się pobrać informacji o moderacji.')
+      }
+    }
+    void refreshModeration()
+    const timer = window.setInterval(() => { void refreshModeration() }, 30_000)
+    return () => {
+      active = false
+      window.clearInterval(timer)
+    }
+  }, [])
 
   useEffect(() => {
     if (recordingPostId === null) return
@@ -458,8 +598,10 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
   const crewHandles = allUsers.filter((person) => person.handle !== currentUser.handle && crewLinks.some((link) => crewPairKey(link[0], link[1]) === crewPairKey(currentUser.handle, person.handle))).map((person) => person.handle)
   const chatContacts = allUsers.filter((person) => person.handle !== currentUser.handle)
   const activeChat = chatContacts.find((person) => person.handle === activeChatHandle) ?? null
-  const publicChatMessages = chatMessages.filter((message) => message.scope === 'public')
-  const roomMessages = chatMessages.filter((message) => message.scope === 'room' && activeChat && ((message.author.handle === currentUser.handle && message.recipientHandle === activeChat.handle) || (message.author.handle === activeChat.handle && message.recipientHandle === currentUser.handle)))
+  const isMessageModerated = (message: ChatMessage) => moderatedItems.some((item) =>
+    item.targetType === 'message' && item.targetId === `message:${message.id}` && item.targetUserId === message.author.id)
+  const publicChatMessages = chatMessages.filter((message) => message.scope === 'public' && !isMessageModerated(message))
+  const roomMessages = chatMessages.filter((message) => message.scope === 'room' && !isMessageModerated(message) && activeChat && ((message.author.handle === currentUser.handle && message.recipientHandle === activeChat.handle) || (message.author.handle === activeChat.handle && message.recipientHandle === currentUser.handle)))
   const incomingCrewInvitations = crewInvitations.filter((invitation) => invitation.to.handle === currentUser.handle && invitation.status === 'pending')
   const suppressedSuggestionHandles = crewInvitations.filter((invitation) => invitation.from.handle === currentUser.handle && (invitation.status === 'pending' || (invitation.status === 'declined' && clockNow - (invitation.respondedAt ?? 0) < 24 * 60 * 60 * 1000))).map((invitation) => invitation.to.handle)
   const activeRoomInvitation = activeChat && crewInvitations.find((invitation) => invitation.status === 'pending' && crewPairKey(invitation.from.handle, invitation.to.handle) === crewPairKey(currentUser.handle, activeChat.handle))
@@ -474,9 +616,62 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
   const band = accessibleBands.find((item) => item.id === activeBandId) ?? accessibleBands[0] ?? null
   const bandMembers = band ? allUsers.filter((person) => band.memberHandles.includes(person.handle)) : []
   const bandPosts = band ? posts.filter((post) => post.bandId === band.id) : []
-  const currentBandStories = bandStories.filter((story) => story.bandId === band?.id && story.expiresAt > clockNow)
-  const currentPersonalStories = personalStories.filter((story) => story.expiresAt > clockNow && (story.author.handle === currentUser.handle || crewHandles.includes(story.author.handle)))
-  const viewedStory = currentBandStories.find((story) => story.id === activeStoryId) ?? currentPersonalStories.find((story) => story.id === activeStoryId)
+  const currentBandStories = useMemo(() => bandStories.filter((story) => story.bandId === band?.id && story.expiresAt > clockNow), [bandStories, band?.id, clockNow])
+  const currentPersonalStories = useMemo(() => personalStories.filter((story) => story.expiresAt > clockNow && (story.author.handle === currentUser.handle || crewHandles.includes(story.author.handle))), [clockNow, crewHandles, currentUser.handle, personalStories])
+  const storyQueue = useMemo(() => [
+    ...currentPersonalStories.map((story) => ({ key: `personal-${story.id}`, source: 'personal' as const, story })),
+    ...currentBandStories.map((story) => ({ key: `band-${story.id}`, source: 'band' as const, story })),
+  ].sort((first, second) => second.story.expiresAt - first.story.expiresAt), [currentBandStories, currentPersonalStories])
+  const activeStoryIndex = storyQueue.findIndex((entry) => entry.key === activeStoryKey)
+  const viewedStory = activeStoryIndex >= 0 ? storyQueue[activeStoryIndex].story : undefined
+
+  useEffect(() => {
+    if (!activeStoryKey) {
+      setStoryProgress(0)
+      return
+    }
+    if (activeStoryIndex < 0) {
+      setActiveStoryKey(null)
+      return
+    }
+
+    let elapsed = 0
+    let previousTick = Date.now()
+    setStoryProgress(0)
+    const timer = window.setInterval(() => {
+      const now = Date.now()
+      if (document.visibilityState === 'visible') elapsed += now - previousTick
+      previousTick = now
+      setStoryProgress(Math.min((elapsed / 15000) * 100, 100))
+      if (elapsed >= 15000) {
+        window.clearInterval(timer)
+        moveStory(1)
+      }
+    }, 100)
+
+    return () => window.clearInterval(timer)
+  }, [activeStoryIndex, activeStoryKey, storyQueue])
+
+  useEffect(() => {
+    if (!activeStoryKey) return
+    const previousOverflow = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setActiveStoryKey(null)
+      else if (event.key === 'ArrowRight') {
+        event.preventDefault()
+        moveStory(1)
+      } else if (event.key === 'ArrowLeft') {
+        event.preventDefault()
+        moveStory(-1)
+      }
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => {
+      document.body.style.overflow = previousOverflow
+      window.removeEventListener('keydown', handleKeyDown)
+    }
+  }, [activeStoryKey, storyQueue])
   const unreadBandCount = accessibleBands.reduce((count, item) => {
     const itemPosts = item.id === band?.id ? bandPosts : posts.filter((post) => post.bandId === item.id)
     return count + itemPosts.filter((post) => post.author.handle !== currentUser.handle && !post.seenBy?.includes(currentUser.handle)).length
@@ -579,8 +774,10 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
   }, [currentUser.handle])
 
   const topikiPosts = useMemo(() => posts
-    .filter((post) => !post.bandId && Boolean(post.video))
-    .sort((first, second) => (second.boosts + second.likes) - (first.boosts + first.likes) || second.boosts - first.boosts || second.likes - first.likes || second.id - first.id), [posts])
+    .filter((post) => !post.bandId && Boolean(post.video) && !moderatedItems.some((item) =>
+      (item.targetType === 'post' && item.targetId === `post:${post.id}` || item.targetType === 'video' && item.targetId === `video:${post.id}`)
+      && item.targetUserId === post.author.id))
+    .sort((first, second) => (second.boosts + second.likes) - (first.boosts + first.likes) || second.boosts - first.boosts || second.likes - first.likes || second.id - first.id), [moderatedItems, posts])
   const proposedTopiki = topikiPosts.filter((post) => post.author.handle !== currentUser.handle && !crewHandles.includes(post.author.handle) && !post.boostedBy?.some((handle) => handle === currentUser.handle || crewHandles.includes(handle)))
   const topicCatalog = useMemo(() => {
     const topics = new Map<string, { name: string; count: number; videos: number }>()
@@ -600,7 +797,8 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
   const sidebarTopics = [...topicCatalog].sort((first, second) => Number(followedTopics.includes(normalizeTopicName(second.name))) - Number(followedTopics.includes(normalizeTopicName(first.name))) || second.count - first.count).slice(0, 4)
 
   const filteredPosts = useMemo(() => {
-    let result = posts
+    let result = posts.filter((post) => !moderatedItems.some((item) =>
+      item.targetType === 'post' && item.targetId === `post:${post.id}` && item.targetUserId === post.author.id))
     if (isBandView) result = result.filter((post) => post.bandId === band?.id)
     else {
       result = result.filter((post) => !post.bandId)
@@ -622,7 +820,7 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
     }
     if (isBandView) result = [...result].sort((first, second) => Number(Boolean(second.pinnedAt)) - Number(Boolean(first.pinnedAt)) || (second.pinnedAt ?? 0) - (first.pinnedAt ?? 0))
     return result
-  }, [band?.id, crewHandles, currentUser.handle, feedMode, followedTopics, homeTab, isBandView, posts, profile.handle, search, selectedTopic, topikiPosts, view])
+  }, [band?.id, crewHandles, currentUser.handle, feedMode, followedTopics, homeTab, isBandView, moderatedItems, posts, profile.handle, search, selectedTopic, topikiPosts, view])
 
   useEffect(() => {
     if (view !== 'topiki') return
@@ -661,6 +859,26 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
     if (nextView !== 'profile') setProfile(currentUser)
   }
 
+  async function submitSupportTicket(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    setSupportBusy(true)
+    try {
+      const { ticket } = await authRequest<{ ticket: SupportTicket }>('/api/support/tickets', {
+        subject: supportSubject,
+        category: supportCategory,
+        message: supportMessage,
+      })
+      setSupportTickets((current) => [ticket, ...current])
+      setSupportSubject('')
+      setSupportMessage('')
+      setNotice('Wysłaliśmy sprawę do zespołu YouTopic.')
+    } catch (error: unknown) {
+      setNotice(error instanceof Error ? error.message : 'Nie udało się wysłać sprawy.')
+    } finally {
+      setSupportBusy(false)
+    }
+  }
+
   function openTopic(topic: string) {
     setView('explore')
     setHomeTab('board')
@@ -694,6 +912,36 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
     setProfile(allUsers.find((candidate) => candidate.handle === person.handle) ?? person)
     setView('profile')
     setSearch('')
+  }
+
+  async function reportContent(targetType: 'profile' | 'post' | 'photo' | 'video' | 'comment' | 'message', targetId: string, target: Person, contentPreview = '', contentUrl = '') {
+    if (!target.id || target.handle === currentUser.handle) {
+      setNotice('Tę treść można zgłosić po powiązaniu jej autora z kontem platformy.')
+      window.setTimeout(() => setNotice(''), 3000)
+      return
+    }
+    const reason = window.prompt(`Dlaczego zgłaszasz ${reportTypeName(targetType)}${targetType === 'profile' ? ` ${target.name}` : ''}?`)
+    if (!reason?.trim()) return
+    try {
+      await authRequest('/api/reports', {
+        targetType,
+        targetId,
+        targetUserId: target.id,
+        reason: reason.trim(),
+        contentPreview: contentPreview.slice(0, 1000),
+        contentUrl: /^https?:\/\//i.test(contentUrl) ? contentUrl.slice(0, 2048) : '',
+      })
+      setNotice('Dziękujemy. Zgłoszenie zostało przekazane do zespołu moderacji.')
+      window.setTimeout(() => setNotice(''), 3000)
+    } catch (reportError) {
+      setNotice(reportError instanceof Error ? reportError.message : 'Nie udało się wysłać zgłoszenia.')
+      window.setTimeout(() => setNotice(''), 3000)
+    }
+  }
+
+  function reportProfile(person: Person) {
+    if (!person.id) return
+    void reportContent('profile', `profile:${person.id}`, person)
   }
 
   async function copyProfileLink(person: Person) {
@@ -1020,28 +1268,62 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
   }
 
   function openPersonalStory(storyId: number) {
-    setActiveStoryId(storyId)
+    setActiveStoryKey(`personal-${storyId}`)
     setPersonalStories((current) => current.map((story) => story.id === storyId
       ? { ...story, seenBy: [...new Set([...story.seenBy, currentUser.handle])], seenPeople: [...(story.seenPeople ?? []).filter((person) => person.handle !== currentUser.handle), currentUser] }
       : story))
   }
 
   function openBandStory(storyId: number) {
-    setActiveStoryId(storyId)
+    setActiveStoryKey(`band-${storyId}`)
     setBandStories((current) => current.map((story) => story.id === storyId
       ? { ...story, seenBy: [...new Set([...story.seenBy, currentUser.handle])], seenPeople: [...(story.seenPeople ?? []).filter((person) => person.handle !== currentUser.handle), currentUser] }
       : story))
   }
 
+  function markStorySeen(entry: (typeof storyQueue)[number]) {
+    if (entry.source === 'personal') openPersonalStory(entry.story.id)
+    else openBandStory(entry.story.id)
+  }
+
+  function moveStory(direction: -1 | 1) {
+    const currentIndex = storyQueue.findIndex((entry) => entry.key === activeStoryKey)
+    if (currentIndex < 0) {
+      setActiveStoryKey(null)
+      return
+    }
+    const nextStory = storyQueue[currentIndex + direction]
+    if (!nextStory) {
+      setActiveStoryKey(null)
+      return
+    }
+    markStorySeen(nextStory)
+  }
+
   function chooseMedia(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0]
     if (!file) return
+    const input = event.currentTarget
     const kind = file.type.startsWith('video/') ? 'video' : 'image'
-    setMedia({ url: URL.createObjectURL(file), kind, name: file.name })
-    event.target.value = ''
+    void (async () => {
+      try {
+        let uploadFile = file
+        if (kind === 'image') {
+          const resized = await resizeProfileImage(file, 1600)
+          const blob = await (await fetch(resized)).blob()
+          uploadFile = new File([blob], file.name.replace(/\.[^.]+$/, '.jpg'), { type: 'image/jpeg' })
+        }
+        setMedia({ url: URL.createObjectURL(uploadFile), kind, name: file.name, file: uploadFile })
+      } catch (error: unknown) {
+        setNotice(error instanceof Error ? error.message : 'Nie udało się przygotować pliku.')
+        window.setTimeout(() => setNotice(''), 3000)
+      } finally {
+        input.value = ''
+      }
+    })()
   }
 
-  function publish(event: FormEvent<HTMLFormElement>, audience: 'feed' | 'band' = 'feed') {
+  async function publish(event: FormEvent<HTMLFormElement>, audience: 'feed' | 'band' = 'feed') {
     event.preventDefault()
     const externalUrl = audience === 'band' && bandLink.trim() ? normalizeExternalUrl(bandLink) : ''
     if (audience === 'band' && bandLink.trim() && !externalUrl) {
@@ -1050,6 +1332,33 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
       return
     }
     if ((!draft.trim() && !media && !externalUrl) || (audience === 'band' && !band)) return
+    if (audience === 'feed') {
+      try {
+        let mediaId: string | undefined
+        if (media) {
+          const uploaded = await uploadMedia(media.file)
+          mediaId = uploaded.id
+        }
+        const { post } = await authRequest<{ post: Post }>('/api/posts', {
+          topic: draftTopic.trim().replace(/^#+\s*/, '') || 'Z TWOJEGO ŚWIATA',
+          text: draft.trim(),
+          imageMediaId: media?.kind === 'image' ? mediaId : undefined,
+          videoMediaId: media?.kind === 'video' ? mediaId : undefined,
+        })
+        setPosts((current) => [post, ...current.filter((item) => item.id !== post.id)])
+        setDraft('')
+        setDraftTopic('')
+        setIsChoosingDraftTopic(false)
+        if (media) URL.revokeObjectURL(media.url)
+        setMedia(null)
+        setNotice('Post dodany i zapisany na serwerze')
+        window.setTimeout(() => setNotice(''), 2600)
+      } catch (error: unknown) {
+        setNotice(error instanceof Error ? error.message : 'Nie udało się opublikować posta.')
+        window.setTimeout(() => setNotice(''), 4000)
+      }
+      return
+    }
     setPosts((current) => [{
       id: Date.now(),
       author: currentUser,
@@ -1080,7 +1389,29 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
     window.setTimeout(() => setNotice(''), 2600)
   }
 
-  function togglePost(id: number, key: 'liked' | 'saved') {
+  function replaceSyncedPost(post: Post) {
+    setPosts((current) => current.some((item) => item.id === post.id)
+      ? current.map((item) => item.id === post.id ? post : item)
+      : [post, ...current])
+  }
+
+  function showPostError(error: unknown, fallback: string) {
+    setNotice(error instanceof Error ? error.message : fallback)
+    window.setTimeout(() => setNotice(''), 3500)
+  }
+
+  async function togglePost(id: number, key: 'liked' | 'saved') {
+    const post = posts.find((item) => item.id === id)
+    if (post?.serverBacked) {
+      try {
+        const action = key === 'liked' ? 'like' : 'save'
+        const result = await authRequest<{ post: Post }>(`/api/posts/${id}/${action}`, {})
+        replaceSyncedPost(result.post)
+      } catch (error: unknown) {
+        showPostError(error, 'Nie udało się zapisać zmiany.')
+      }
+      return
+    }
     setPosts((current) => current.map((post) => post.id === id ? {
       ...post,
       [key]: !post[key],
@@ -1088,11 +1419,23 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
     } : post))
   }
 
-  function submitComment(event: FormEvent<HTMLFormElement>, postId: number) {
+  async function submitComment(event: FormEvent<HTMLFormElement>, postId: number) {
     event.preventDefault()
     const comment = commentDraft[postId]?.trim()
     if (!comment) return
     const reply = replyingTo[postId]
+    const post = posts.find((item) => item.id === postId)
+    if (post?.serverBacked) {
+      try {
+        const result = await authRequest<{ post: Post }>(`/api/posts/${postId}/comments`, { text: comment, replyToId: reply?.id })
+        replaceSyncedPost(result.post)
+        setCommentDraft((current) => ({ ...current, [postId]: '' }))
+        setReplyingTo((current) => ({ ...current, [postId]: null }))
+      } catch (error: unknown) {
+        showPostError(error, 'Nie udało się dodać komentarza.')
+      }
+      return
+    }
     setPosts((current) => current.map((post) => post.id === postId ? {
       ...post,
       comments: [...post.comments, { id: Date.now(), author: currentUser, text: comment, likes: 0, likedBy: [], replyToId: reply?.id }],
@@ -1101,7 +1444,17 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
     setReplyingTo((current) => ({ ...current, [postId]: null }))
   }
 
-  function toggleCommentLike(postId: number, commentId: number) {
+  async function toggleCommentLike(postId: number, commentId: number) {
+    const post = posts.find((item) => item.id === postId)
+    if (post?.serverBacked) {
+      try {
+        const { post: updated } = await authRequest<{ post: Post }>(`/api/posts/${postId}/comments/${commentId}/like`, {})
+        replaceSyncedPost(updated)
+      } catch (error: unknown) {
+        showPostError(error, 'Nie udało się polubić komentarza.')
+      }
+      return
+    }
     setPosts((current) => current.map((post) => {
       if (post.id !== postId) return post
       return { ...post, comments: normalizePostComments(post).map((comment) => {
@@ -1113,7 +1466,18 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
     }))
   }
 
-  function deleteOwnComment(postId: number, commentId: number) {
+  async function deleteOwnComment(postId: number, commentId: number) {
+    const post = posts.find((item) => item.id === postId)
+    if (post?.serverBacked) {
+      try {
+        const { post: updated } = await fetchPostMutation(`/api/posts/${postId}/comments/${commentId}`, 'DELETE')
+        replaceSyncedPost(updated)
+        setReplyingTo((current) => current[postId]?.id === commentId ? { ...current, [postId]: null } : current)
+      } catch (error: unknown) {
+        showPostError(error, 'Nie udało się usunąć komentarza.')
+      }
+      return
+    }
     setPosts((current) => current.map((post) => {
       if (post.id !== postId) return post
       const comments = normalizePostComments(post)
@@ -1166,7 +1530,7 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
         if (blob.size === 0) return
         const url = URL.createObjectURL(blob)
         const reader = new FileReader()
-        reader.onload = () => setVoiceDraft({ postId, url, audioData: String(reader.result), audioType: blob.type, duration })
+        reader.onload = () => setVoiceDraft({ postId, url, audioData: String(reader.result), audioType: blob.type, duration, blob })
         reader.onerror = () => {
           URL.revokeObjectURL(url)
           setNotice('Nie udało się przygotować nagrania')
@@ -1199,9 +1563,23 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
     setVoiceDraft(null)
   }
 
-  function submitVoiceComment(event: FormEvent<HTMLFormElement>, postId: number) {
+  async function submitVoiceComment(event: FormEvent<HTMLFormElement>, postId: number) {
     event.preventDefault()
     if (!voiceDraft || voiceDraft.postId !== postId) return
+    const post = posts.find((item) => item.id === postId)
+    if (post?.serverBacked) {
+      try {
+        const uploaded = await uploadMedia(voiceDraft.blob)
+        const { post: updated } = await authRequest<{ post: Post }>(`/api/posts/${postId}/comments`, { audioMediaId: uploaded.id })
+        replaceSyncedPost(updated)
+      } catch (error: unknown) {
+        showPostError(error, 'Nie udało się wysłać nagrania.')
+        return
+      }
+      URL.revokeObjectURL(voiceDraft.url)
+      setVoiceDraft(null)
+      return
+    }
     setPosts((current) => current.map((post) => post.id === postId ? {
       ...post,
       comments: [...post.comments, { id: Date.now(), author: currentUser, audioData: voiceDraft.audioData, audioType: voiceDraft.audioType, audioDuration: voiceDraft.duration }],
@@ -1210,8 +1588,17 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
     setVoiceDraft(null)
   }
 
-  function boostPost(id: number) {
+  async function boostPost(id: number) {
     const existingPost = posts.find((post) => post.id === id)
+    if (existingPost?.serverBacked) {
+      try {
+        const { post } = await authRequest<{ post: Post }>(`/api/posts/${id}/boost`, {})
+        replaceSyncedPost(post)
+      } catch (error: unknown) {
+        showPostError(error, 'Nie udało się podbić posta.')
+      }
+      return
+    }
     if (!existingPost || existingPost.bandId) return
     if (existingPost.boostedBy?.includes(currentUser.handle)) {
       setNotice('Już podbiłeś ten post')
@@ -1276,6 +1663,7 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
     crew: 'Twoja Ekipa',
     band: band?.name ?? 'Twoja Banda',
     notifications: 'Powiadomienia',
+    support: 'Centrum pomocy',
     saved: 'Zapisane posty',
     profile: profile.handle === currentUser.handle ? 'Twój profil' : profile.name,
   }
@@ -1286,6 +1674,7 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
         <a className="brand" href="#tablica" onClick={(event) => { event.preventDefault(); showView('home') }} aria-label="YouTopic, tablica">
           <img className="brand-mark" src="/youtopic-mark.svg" alt="" />
           <span>You<span className="brand-accent">Topic</span></span>
+          <span className="beta-badge">beta</span>
         </a>
         <label className="search-box">
           <Search size={17} strokeWidth={1.8} />
@@ -1302,6 +1691,10 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
           <button className="icon-button logout-top" onClick={onLogout} aria-label="Wyloguj się" title="Wyloguj się"><LogOut size={17} /></button>
         </div>
       </header>
+      <aside className="beta-announcement" role="note">
+        <strong>Wersja beta</strong>
+        <span>Testujemy YouTopic — część funkcji może działać niekompletnie. Dziękujemy za zgłaszanie uwag.</span>
+      </aside>
       <div className="page-layout">
         <aside className="left-rail">
           <div className="rail-label">MENU GŁÓWNE</div>
@@ -1337,6 +1730,16 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
           </button>
         </aside>
         <main className="main-column">
+          {announcements.filter((announcement) => !dismissedAnnouncements.includes(announcement.id)).map((announcement) => (
+            <section className="community-announcement" key={announcement.id} aria-label="Komunikat administracji">
+              <div><p className="eyebrow">KOMUNIKAT YOUTOPIC</p><strong>{announcement.title}</strong><p>{announcement.message}</p></div>
+              <button aria-label={`Zamknij komunikat: ${announcement.title}`} onClick={() => {
+                const next = [...dismissedAnnouncements, announcement.id]
+                setDismissedAnnouncements(next)
+                saveStored(storageKeys.dismissedAnnouncements, next)
+              }}><X size={17} /></button>
+            </section>
+          ))}
           <div className="content-heading">
             <div>
               <p className="eyebrow">{dateLabel}</p>
@@ -1412,6 +1815,7 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
                 {publicChatMessages.map((message) => <article className="public-chat-message" key={message.id}>
                   <button className="public-chat-avatar" onClick={() => openChatRoom(message.author)}><img src={message.author.avatar} alt="" />{message.author.online && <i />}</button>
                   <div className="public-chat-message-body"><div className="public-chat-message-meta"><button onClick={() => openChatRoom(message.author)}>{message.author.name}</button><span>@{message.author.handle}</span><time>{message.time}</time></div><p>{message.text}</p></div>
+                  {message.author.id && message.author.id !== currentUser.id && <button className="chat-report-button" onClick={() => void reportContent('message', `message:${message.id}`, message.author, message.text)} aria-label="Zgłoś wiadomość" title="Zgłoś wiadomość"><Flag size={15} /></button>}
                   <button className="public-chat-room-link" onClick={() => openChatRoom(message.author)} aria-label={`Napisz prywatnie do ${message.author.name}`} title="Przejdź do Pokoju"><MessageCircle size={16} /></button>
                 </article>)}
                 {publicChatMessages.length === 0 && <div className="chat-intro"><span><MessageCircle size={19} /></span><strong>Rozpocznij rozmowę</strong><p>Napisz wiadomość jako pierwszy.</p></div>}
@@ -1423,7 +1827,7 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
               {activeRoomInvitation?.from.handle === currentUser.handle && <div className="room-invitation-status">Zaproszenie do Ekipy czeka na odpowiedź.</div>}
               <div className="chat-room-messages" aria-live="polite">
                 <div className="chat-intro"><span><MessageCircle size={19} /></span><strong>Poznajcie się</strong><p>To prywatny Pokój tylko dla Ciebie i {activeChat.name.split(' ')[0]}.</p></div>
-                {roomMessages.map((message) => <article className={`room-message ${message.author.handle === currentUser.handle ? 'from-you' : ''}`} key={message.id}>{message.author.handle !== currentUser.handle && <img src={message.author.avatar} alt="" />}<div><p>{message.text}</p><small>{message.time}</small></div></article>)}
+                {roomMessages.map((message) => <article className={`room-message ${message.author.handle === currentUser.handle ? 'from-you' : ''}`} key={message.id}>{message.author.handle !== currentUser.handle && <img src={message.author.avatar} alt="" />}<div><p>{message.text}</p><small>{message.time}</small>{message.author.id && message.author.id !== currentUser.id && <button className="chat-report-button" onClick={() => void reportContent('message', `message:${message.id}`, message.author, message.text)} aria-label="Zgłoś wiadomość" title="Zgłoś wiadomość"><Flag size={13} />Zgłoś</button>}</div></article>)}
               </div>
               <div className="room-actions">{crewHandles.includes(activeChat.handle) ? <span className="room-crew-status"><Check size={15} /> Jesteście w Ekipie</span> : activeRoomInvitation ? <span className="room-crew-status">Zaproszenie wysłane</span> : <button onClick={() => sendCrewInvitation(activeChat)}><UsersRound size={15} /> Zaproś do Ekipy</button>}</div>
               <form className="chat-composer" onSubmit={sendRoomMessage}><input value={chatDraft} onChange={(event) => setChatDraft(event.target.value)} placeholder={`Wiadomość do ${activeChat.name.split(' ')[0]}...`} aria-label="Wiadomość prywatna" /><button type="submit" disabled={!chatDraft.trim()} aria-label="Wyślij wiadomość"><Send size={17} /></button></form>
@@ -1458,7 +1862,6 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
 
           {isBandView && band && !isCreatingBand && <>
             <section className="band-banner">
-          <span className="beta-badge">beta</span>
               <div className="band-banner-icon"><LockKeyhole size={20} /></div>
               <div className="band-banner-copy"><span>PRYWATNA BANDA</span><h2>{band.name}</h2><p>Tylko Ty i zaproszeni ekipowicze widzicie tę tablicę.</p></div>
               <div className="band-banner-actions">
@@ -1475,10 +1878,6 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
             <section className="band-stories" aria-label="Relacje członków bandy">
               <div className="band-stories-heading"><span>RELACJE BANDY</span><small>Znikają po 24 godzinach</small></div>
               <div className="band-story-list">
-      <aside className="beta-announcement" role="note">
-        <strong>Wersja beta</strong>
-        <span>Testujemy YouTopic — część funkcji może działać niekompletnie. Dziękujemy za zgłaszanie uwag.</span>
-      </aside>
                 <button className="band-story band-story-create" onClick={() => storyTextInput.current?.focus()}>
                   <span className="band-story-ring"><img src={currentUser.avatar} alt="" /><i><Plus size={13} /></i></span><span>Twoja relacja</span>
                 </button>
@@ -1534,6 +1933,14 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
           </section>}
 
           {view === 'notifications' && <section className="notifications-panel">
+            {reportNotifications.length > 0 && <>
+              <div className="section-caption">DECYZJE ZGŁOSZEŃ <span>{reportNotifications.length}</span></div>
+              {reportNotifications.map((notification) => <div className="notification-row report-decision-notification" key={notification.id}>
+                <img src="/youtopic-mark.svg" alt="" />
+                <p><strong>YouTopic — moderacja</strong><br />{notification.message}<small>{new Intl.DateTimeFormat('pl-PL', { dateStyle: 'medium', timeStyle: 'short' }).format(notification.createdAt)}</small></p>
+                <Flag size={17} />
+              </div>)}
+            </>}
             <div className="section-caption">DZISIAJ <span>3 nowe</span></div>
             <div className="notification-row"><img src={people[1].avatar} alt="" /><p><strong>Zosia Kowalska</strong> i <strong>12 innych osób</strong> polubiło Twój komentarz. <small>12 min temu</small></p><Heart size={17} /></div>
             <div className="notification-row"><img src={people[0].avatar} alt="" /><p><strong>Olek Wiśniewski</strong> dodał nowy post w temacie <b>Miasto i podróże</b>. <small>38 min temu</small></p><span className="notification-unread" /></div>
@@ -1541,7 +1948,28 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
             <SuggestedProfiles people={suggestedProfiles} boostCounts={profileBoostCounts} onOpen={openProfile} onAdd={sendCrewInvitation} onDismiss={dismissSuggestedProfile} />
           </section>}
 
-          {view === 'profile' && <ProfileHeader person={profile} isOwn={profile.handle === currentUser.handle} isCrewMember={crewHandles.includes(profile.handle)} isEditingProfile={isEditingProfile} nicknameDraft={nicknameDraft} firstNameDraft={firstNameDraft} middleNameDraft={middleNameDraft} lastNameDraft={lastNameDraft} secondLastNameDraft={secondLastNameDraft} locationDraft={locationDraft} contactPhoneDraft={contactPhoneDraft} secondContactPhoneDraft={secondContactPhoneDraft} bioDraft={bioDraft} avatarDraft={avatarDraft} coverImageDraft={coverImageDraft} socialLinksDraft={socialLinksDraft} profileVisibilityDraft={profileVisibilityDraft} profileError={profileError} isSavingProfile={isSavingProfile} onEditProfile={beginProfileEdit} onNicknameDraftChange={setNicknameDraft} onFirstNameDraftChange={setFirstNameDraft} onMiddleNameDraftChange={setMiddleNameDraft} onLastNameDraftChange={setLastNameDraft} onSecondLastNameDraftChange={setSecondLastNameDraft} onLocationDraftChange={setLocationDraft} onContactPhoneDraftChange={setContactPhoneDraft} onSecondContactPhoneDraftChange={setSecondContactPhoneDraft} onBioDraftChange={setBioDraft} onSocialLinksDraftChange={setSocialLinksDraft} onProfileVisibilityDraftChange={setProfileVisibilityDraft} onImageChange={changeProfileImage} onSaveProfile={saveProfile} onCancelProfile={cancelProfileEdit} isCrewInvitationPending={crewInvitations.some((invitation) => invitation.from.handle === currentUser.handle && invitation.to.handle === profile.handle && invitation.status === 'pending')} isBandAdmin={Boolean(band && profile.handle === band.adminHandle)} onToggleCrew={() => toggleCrew(profile)} onPromote={() => setProfileBoostTarget(profile)} postCount={posts.filter((post) => post.author.handle === profile.handle).length} />}
+          {view === 'support' && <section className="support-panel">
+            <div className="support-intro"><span><LifeBuoy size={22} /></span><div><strong>W czym możemy pomóc?</strong><p>Opisz problem lub pomysł. Odpowiedź zespołu znajdziesz tutaj.</p></div></div>
+            <form className="support-request-form" onSubmit={submitSupportTicket}>
+              <label>Temat sprawy<input value={supportSubject} onChange={(event) => setSupportSubject(event.target.value)} maxLength={120} required placeholder="Krótko opisz sprawę" /></label>
+              <label>Kategoria<select value={supportCategory} onChange={(event) => setSupportCategory(event.target.value as SupportTicket['category'])}><option value="account">Konto</option><option value="technical">Problem techniczny</option><option value="security">Bezpieczeństwo</option><option value="idea">Pomysł lub sugestia</option><option value="other">Inne</option></select></label>
+              <label>Opis<textarea value={supportMessage} onChange={(event) => setSupportMessage(event.target.value)} minLength={10} maxLength={5000} rows={5} required placeholder="Podaj szczegóły, które pomogą nam rozwiązać sprawę..." /></label>
+              <button className="publish-button" type="submit" disabled={supportBusy}>{supportBusy ? 'Wysyłanie…' : 'Wyślij do pomocy'} <Send size={15} /></button>
+            </form>
+            <div className="section-caption">TWOJE SPRAWY <button type="button" onClick={() => {
+              void authRequest<{ tickets: SupportTicket[] }>('/api/support/tickets')
+                .then(({ tickets }) => setSupportTickets(tickets))
+                .catch((error: unknown) => setNotice(error instanceof Error ? error.message : 'Nie udało się odświeżyć spraw.'))
+            }}>Odśwież</button></div>
+            {supportTickets.length === 0 && <p className="support-empty">Nie masz jeszcze wysłanych spraw.</p>}
+            <div className="support-own-tickets">{supportTickets.map((ticket) => <article className="support-own-ticket" key={ticket.id}>
+              <header><strong>{ticket.subject}</strong><span className={`ticket-status status-${ticket.status}`}>{ticket.status === 'resolved' ? 'Rozwiązana' : ticket.status === 'in_progress' ? 'W trakcie' : 'Otwarta'}</span></header>
+              <small>{new Intl.DateTimeFormat('pl-PL', { dateStyle: 'medium', timeStyle: 'short' }).format(ticket.updatedAt)}</small>
+              {ticket.messages.map((item) => <div className={`support-own-message ${item.authorType}`} key={item.id}><strong>{item.authorType === 'admin' ? `Zespół YouTopic · ${item.authorName}` : 'Ty'}</strong><p>{item.message}</p></div>)}
+            </article>)}</div>
+          </section>}
+
+          {view === 'profile' && <ProfileHeader person={profile} isOwn={profile.handle === currentUser.handle} isCrewMember={crewHandles.includes(profile.handle)} isEditingProfile={isEditingProfile} nicknameDraft={nicknameDraft} firstNameDraft={firstNameDraft} middleNameDraft={middleNameDraft} lastNameDraft={lastNameDraft} secondLastNameDraft={secondLastNameDraft} locationDraft={locationDraft} contactPhoneDraft={contactPhoneDraft} secondContactPhoneDraft={secondContactPhoneDraft} bioDraft={bioDraft} avatarDraft={avatarDraft} coverImageDraft={coverImageDraft} socialLinksDraft={socialLinksDraft} profileVisibilityDraft={profileVisibilityDraft} profileError={profileError} isSavingProfile={isSavingProfile} onEditProfile={beginProfileEdit} onNicknameDraftChange={setNicknameDraft} onFirstNameDraftChange={setFirstNameDraft} onMiddleNameDraftChange={setMiddleNameDraft} onLastNameDraftChange={setLastNameDraft} onSecondLastNameDraftChange={setSecondLastNameDraft} onLocationDraftChange={setLocationDraft} onContactPhoneDraftChange={setContactPhoneDraft} onSecondContactPhoneDraftChange={setSecondContactPhoneDraft} onBioDraftChange={setBioDraft} onSocialLinksDraftChange={setSocialLinksDraft} onProfileVisibilityDraftChange={setProfileVisibilityDraft} onImageChange={changeProfileImage} onSaveProfile={saveProfile} onCancelProfile={cancelProfileEdit} isCrewInvitationPending={crewInvitations.some((invitation) => invitation.from.handle === currentUser.handle && invitation.to.handle === profile.handle && invitation.status === 'pending')} isBandAdmin={Boolean(band && profile.handle === band.adminHandle)} onToggleCrew={() => toggleCrew(profile)} onPromote={() => setProfileBoostTarget(profile)} onReportProfile={() => void reportProfile(profile)} postCount={posts.filter((post) => post.author.handle === profile.handle).length} />}
 
           {showPostFeed && <div className="feed-label">
             <span>{view === 'topiki' ? 'FILMY SPOŁECZNOŚCI' : view === 'saved' ? 'KOLEKCJA' : view === 'profile' ? 'POSTY' : view === 'explore' ? 'NA TEMAT' : isBandView ? 'ZAMKNIĘTA TABLICA BANDY' : view === 'home' ? 'OD EKIPY I POLECONE POSTY' : view === 'crew' ? 'POSTY Z TWOJEJ EKIPY' : 'POSTY Z TABLICY'}</span>
@@ -1566,18 +1994,20 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
                     <img src={post.author.avatar} alt="" />
                     <span><strong>{post.author.name}{band && post.bandId === band.id && post.author.handle === band.adminHandle && <span className="admin-badge">Admin</span>}</strong><small>@{post.author.handle} <i>·</i> {post.time}</small></span>
                   </button>
-                  <button className="post-menu" aria-label="Więcej opcji"><MoreHorizontal size={20} /></button>
+                  {post.author.id && post.author.id !== currentUser.id
+                    ? <button className="post-menu" aria-label="Zgłoś post" title="Zgłoś post" onClick={() => void reportContent('post', `post:${post.id}`, post.author, post.text)}><Flag size={18} /></button>
+                    : <button className="post-menu" aria-label="Więcej opcji"><MoreHorizontal size={20} /></button>}
                 </div>
                 <button className="post-topic" onClick={() => openTopic(post.topic)}><span className="topic-hash">#</span>{post.topic}</button>
                 {post.sharedFrom && <div className="band-shared-origin">Udostępniono z Tablicy: <strong>{post.sharedFrom.author.name}</strong><span>#{post.sharedFrom.topic}</span></div>}
                 {post.profileTarget && <button className="promoted-profile-card" onClick={() => openProfile(post.profileTarget!)}><img src={post.profileTarget.avatar} alt="" /><span><small>POLECANY PROFIL</small><strong>{post.profileTarget.name}</strong><small>@{post.profileTarget.handle}</small></span><ArrowUp size={16} /></button>}
                 {post.text && (view === 'topiki' ? <TopikiDescription text={post.text} /> : <p className="post-copy">{post.text}</p>)}
-                {post.image && <img className="post-image" src={post.image} alt="Zdjęcie dołączone do posta" />}
-                {post.video && (view === 'topiki'
+                {post.image && !moderatedItems.some((item) => item.targetType === 'photo' && item.targetId === `photo:${post.id}` && item.targetUserId === post.author.id) && <><img className="post-image" src={post.image} alt="Zdjęcie dołączone do posta" />{post.author.id && post.author.id !== currentUser.id && <button className="media-report-button" type="button" onClick={() => void reportContent('photo', `photo:${post.id}`, post.author, post.text, post.image)}>Zgłoś zdjęcie</button>}</>}
+                {post.video && !moderatedItems.some((item) => item.targetType === 'video' && item.targetId === `video:${post.id}` && item.targetUserId === post.author.id) && <>{view === 'topiki'
                   ? <TopikiVideo src={post.video} autoAdvance={autoAdvanceTopiki} onAutoAdvanceChange={setAutoAdvanceTopiki} onEnded={() => navigateTopiki(1)} />
                   : view === 'home' && homeTab === 'board'
                     ? <button type="button" className="topiki-feed-preview" onClick={() => openTopikiFromPost(post.id)} aria-label={`Otwórz Topik autora ${post.author.name}`}><video src={post.video} muted playsInline preload="metadata" /><span><Play size={18} fill="currentColor" />Oglądaj Topik</span></button>
-                    : <video className="post-image" src={post.video} controls playsInline />)}
+                    : <video className="post-image" src={post.video} controls playsInline />}{post.author.id && post.author.id !== currentUser.id && <button className="media-report-button" type="button" onClick={() => void reportContent('video', `video:${post.id}`, post.author, post.text, post.video)}>Zgłoś wideo</button>}</>}
                 {post.externalUrl && <a className="post-external-link" href={post.externalUrl} target="_blank" rel="noreferrer"><span>LINK ZEWNĘTRZNY</span><strong>{post.externalUrl}</strong></a>}
                 <div className="post-stats"><button onClick={() => toggleComments(post.id)}>{post.comments.length} komentarze</button><span>{boostLabel(post.boosts)}</span></div>
                 {isBandView && <div className="post-read-receipts">
@@ -1601,7 +2031,11 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
                 {openComments.includes(post.id) && <div className="comments-section">
                   {(() => {
                     const comments = normalizePostComments(post)
-                    return comments.filter((comment) => !comment.replyToId).map((comment) => <CommentThread key={comment.id} comment={comment} comments={comments} currentUser={currentUser} onLike={(commentId) => toggleCommentLike(post.id, commentId)} onReply={(reply) => setReplyingTo((current) => ({ ...current, [post.id]: reply }))} onDelete={(commentId) => deleteOwnComment(post.id, commentId)} />)
+                    const visibleComments = comments.filter((comment) => !moderatedItems.some((item) => item.targetType === 'comment' && item.targetId === `comment:${post.id}:${comment.id}` && item.targetUserId === comment.author.id))
+                    return visibleComments.filter((comment) => !comment.replyToId).map((comment) => <CommentThread key={comment.id} comment={comment} comments={visibleComments} currentUser={currentUser} onLike={(commentId) => toggleCommentLike(post.id, commentId)} onReply={(reply) => setReplyingTo((current) => ({ ...current, [post.id]: reply }))} onDelete={(commentId) => deleteOwnComment(post.id, commentId)} onReport={(commentId) => {
+                      const reportedComment = visibleComments.find((item) => item.id === commentId)
+                      if (reportedComment) void reportContent('comment', `comment:${post.id}:${reportedComment.id}`, reportedComment.author, reportedComment.text ?? '')
+                    }} />)
                   })()}
                   <form className="comment-form" onSubmit={(event) => submitComment(event, post.id)}>
                     <img src={currentUser.avatar} alt="" />
@@ -1669,18 +2103,44 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
           </form>
         </section>
       </div>}
-      {viewedStory && <div className="story-viewer-backdrop" onClick={() => setActiveStoryId(null)}>
-        <section className={`story-viewer ${viewedStory.media ? 'has-media' : ''}`} role="dialog" aria-modal="true" aria-label={`Relacja: ${viewedStory.author.name}`} onClick={(event) => event.stopPropagation()}>
-          <header><span><img src={viewedStory.author.avatar} alt="" />{viewedStory.author.name}</span><button onClick={() => setActiveStoryId(null)} aria-label="Zamknij relację"><X size={18} /></button></header>
-          {viewedStory.media && viewedStory.mediaKind === 'image' && <img className="story-viewer-media" src={viewedStory.media} alt="Zdjęcie w relacji" />}
-          {viewedStory.media && viewedStory.mediaKind === 'video' && <video className="story-viewer-media" src={viewedStory.media} controls autoPlay />}
-          {viewedStory.text && <p>{viewedStory.text}</p>}
-          <footer><button className="story-view-count" onClick={() => setOpenViewers(openViewers === -viewedStory.id ? null : -viewedStory.id)}><Eye size={14} />{viewedStory.seenBy.length} wyświetleń</button>
+      {viewedStory && <div className="story-viewer-backdrop" onClick={() => setActiveStoryKey(null)}>
+        <section
+          className="story-viewer"
+          role="dialog"
+          aria-modal="true"
+          aria-label={`Relacja: ${viewedStory.author.name}`}
+          tabIndex={-1}
+          autoFocus
+          onClick={(event) => event.stopPropagation()}
+          onTouchStart={(event) => { storyTouchStartXRef.current = event.changedTouches[0]?.clientX ?? null }}
+          onTouchEnd={(event) => {
+            const startX = storyTouchStartXRef.current
+            const endX = event.changedTouches[0]?.clientX
+            storyTouchStartXRef.current = null
+            if (startX !== null && endX !== undefined && Math.abs(startX - endX) > 50) moveStory(startX > endX ? 1 : -1)
+          }}
+        >
+          <div className="story-viewer-progress" aria-hidden="true">
+            {storyQueue.map((entry, index) => <span key={entry.key}><i style={{ width: index < activeStoryIndex ? '100%' : index === activeStoryIndex ? `${storyProgress}%` : '0%' }} /></span>)}
+          </div>
+          <header>
+            <span><img src={viewedStory.author.avatar} alt="" />{viewedStory.author.name}</span>
+            <button onClick={() => setActiveStoryKey(null)} aria-label="Zamknij relację"><X size={20} /></button>
+          </header>
+          <div className={`story-viewer-stage ${viewedStory.media ? 'has-media' : ''}`}>
+            {viewedStory.media && viewedStory.mediaKind === 'image' && <img className="story-viewer-media" src={viewedStory.media} alt="Zdjęcie w relacji" />}
+            {viewedStory.media && viewedStory.mediaKind === 'video' && <video className="story-viewer-media" src={viewedStory.media} autoPlay playsInline />}
+            {viewedStory.text && <p>{viewedStory.text}</p>}
+          </div>
+          <button className="story-nav story-nav-previous" onClick={() => moveStory(-1)} aria-label="Poprzednia relacja" disabled={activeStoryIndex === 0}><ChevronLeft size={26} /></button>
+          <button className="story-nav story-nav-next" onClick={() => moveStory(1)} aria-label="Następna relacja"><ChevronRight size={26} /></button>
+          <footer>
+            <button className="story-view-count" onClick={() => setOpenViewers(openViewers === -viewedStory.id ? null : -viewedStory.id)}><Eye size={14} />{viewedStory.seenBy.length} wyświetleń</button>
             {openViewers === -viewedStory.id && <div className="story-viewer-list">{viewedStory.seenBy.map((handle) => {
               const viewer = handle === currentUser.handle ? currentUser : viewedStory.seenPeople?.find((person) => person.handle === handle) ?? people.find((person) => person.handle === handle)
               return viewer && <span key={handle}><img src={viewer.avatar} alt="" />{viewer.name}</span>
             })}</div>}
-            {viewedStory.author.handle === currentUser.handle && <button className="story-view-count" onClick={() => { setActiveStoryId(null); setIsComposingPersonalStory(true) }}><Plus size={14} />Dodaj kolejną relację</button>}
+            {viewedStory.author.handle === currentUser.handle && <button className="story-view-count" onClick={() => { setActiveStoryKey(null); setIsComposingPersonalStory(true) }}><Plus size={14} />Dodaj kolejną relację</button>}
           </footer>
         </section>
       </div>}
@@ -1710,6 +2170,27 @@ async function authRequest<T>(path: string, payload?: unknown): Promise<T> {
   const result = await response.json().catch(() => ({})) as T & { error?: string }
   if (!response.ok) throw new Error(result.error || 'Nie udało się połączyć z serwerem.')
   return result
+}
+
+async function fetchPostMutation(path: string, method: 'DELETE'): Promise<{ post: Post }> {
+  const response = await fetch(path, { method, credentials: 'include' })
+  const result = await response.json().catch(() => ({})) as { post?: Post; error?: string }
+  if (!response.ok || !result.post) throw new Error(result.error || 'Nie udało się zapisać zmiany.')
+  return { post: result.post }
+}
+
+async function uploadMedia(file: Blob): Promise<{ id: string; url: string; contentType: string }> {
+  const response = await fetch('/api/media', {
+    method: 'POST',
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/octet-stream', 'X-Media-Type': file.type },
+    body: file,
+  })
+  const result = await response.json().catch(() => ({})) as { id?: string; url?: string; contentType?: string; error?: string }
+  if (!response.ok || !result.id || !result.url || !result.contentType) {
+    throw new Error(result.error || 'Nie udało się wysłać pliku na serwer.')
+  }
+  return { id: result.id, url: result.url, contentType: result.contentType }
 }
 
 function AuthScreen({ onAuthenticated }: { onAuthenticated: (user: Person) => void }) {
@@ -1840,6 +2321,7 @@ function AuthScreen({ onAuthenticated }: { onAuthenticated: (user: Person) => vo
       <a className="auth-brand" href="#start" aria-label="YouTopic">
         <img src="/youtopic-mark.svg" alt="" />
         <span>You<span>Topic</span></span>
+        <span className="beta-badge">beta</span>
       </a>
       <div className="auth-brand-message">
         <p className="auth-eyebrow">TWOJE MIEJSCE W SIECI</p>
@@ -1850,6 +2332,10 @@ function AuthScreen({ onAuthenticated }: { onAuthenticated: (user: Person) => vo
     </section>
     <section className="auth-form-panel">
       <div className="auth-form-wrap">
+        <aside className="beta-announcement" role="note">
+          <strong>Wersja beta</strong>
+          <span>Serwis jest w fazie testów. Możesz napotkać błędy lub niepełne funkcje.</span>
+        </aside>
         <p className="auth-kicker">{mode === 'register' ? 'MIŁO, ŻE DOŁĄCZASZ' : mode === 'verify-email' ? 'POTWIERDŹ SWÓJ ADRES' : mode === 'forgot-password' || mode === 'reset-password' ? 'ODZYSKIWANIE KONTA' : 'WRÓĆ DO SWOJEJ EKIPY'}</p>
         <h2>{mode === 'register' ? 'Utwórz konto' : mode === 'verify-email' ? 'Sprawdź pocztę' : mode === 'forgot-password' ? 'Nie pamiętam hasła' : mode === 'reset-password' ? 'Ustaw nowe hasło' : 'Zaloguj się'}</h2>
         <p className="auth-subtitle">{mode === 'register' ? 'Podaj swoje dane, aby dołączyć do YouTopic.' : mode === 'verify-email' ? `Wysłaliśmy link potwierdzający na ${pendingEmail || email || 'Twój adres e-mail'}. Otwórz go, aby aktywować konto.` : mode === 'forgot-password' ? 'Podaj e-mail przypisany do konta i wybierz, gdzie wysłać kod do zmiany hasła.' : mode === 'reset-password' ? resetToken ? 'Ustaw nowe hasło za pomocą wcześniej wysłanego linku.' : `Wpisz kod wysłany na ${resetDestination || 'wybrany kanał'} i ustaw nowe hasło. Kod jest ważny przez 10 minut.` : 'Zaloguj się przy użyciu adresu e-mail i hasła.'}</p>
@@ -1917,13 +2403,14 @@ function commentLikeLabel(count: number) {
   return `${count} polubień`
 }
 
-function CommentThread({ comment, comments, currentUser, onLike, onReply, onDelete, depth = 0 }: {
+function CommentThread({ comment, comments, currentUser, onLike, onReply, onDelete, onReport, depth = 0 }: {
   comment: PostComment
   comments: PostComment[]
   currentUser: Person
   onLike: (commentId: number) => void
   onReply: (comment: PostComment) => void
   onDelete: (commentId: number) => void
+  onReport: (commentId: number) => void
   depth?: number
 }) {
   const replies = comments.filter((item) => item.replyToId === comment.id)
@@ -1935,16 +2422,17 @@ function CommentThread({ comment, comments, currentUser, onLike, onReply, onDele
       <img src={comment.author.avatar} alt="" />
       <div className="comment-content">
         {comment.text && <p><strong>{comment.author.name}</strong>{comment.text}</p>}
-        {comment.audioData && <><strong className="audio-comment-author">{comment.author.name}</strong><audio className="audio-comment-player" controls preload="metadata" src={comment.audioData} /></>}
+        {(comment.audioUrl || comment.audioData) && <><strong className="audio-comment-author">{comment.author.name}</strong><audio className="audio-comment-player" controls preload="metadata" src={comment.audioUrl ?? comment.audioData} /></>}
         <div className="comment-actions">
           <button className={isLiked ? 'comment-liked' : ''} onClick={() => onLike(comment.id)} aria-label={isLiked ? 'Usuń polubienie' : 'Polub komentarz'} title={isLiked ? 'Usuń polubienie' : 'Polub komentarz'}><Heart size={13} fill={isLiked ? 'currentColor' : 'none'} /><span>{commentLikeLabel(comment.likes ?? 0)}</span></button>
           <button onClick={() => onReply(comment)}>Odpowiedz</button>
+          {comment.author.id && comment.author.id !== currentUser.id && <button onClick={() => onReport(comment.id)}>Zgłoś</button>}
           {isAuthor && <button className="delete-comment-button" onClick={() => onDelete(comment.id)}><Trash2 size={12} />Usuń komentarz</button>}
           <span className="comment-reply-count">{replies.length} {commentReplyLabel(replies.length)}</span>
         </div>
       </div>
     </div>
-    {replies.map((reply) => <CommentThread key={reply.id} comment={reply} comments={comments} currentUser={currentUser} onLike={onLike} onReply={onReply} onDelete={onDelete} depth={Math.min(depth + 1, 4)} />)}
+    {replies.map((reply) => <CommentThread key={reply.id} comment={reply} comments={comments} currentUser={currentUser} onLike={onLike} onReply={onReply} onDelete={onDelete} onReport={onReport} depth={Math.min(depth + 1, 4)} />)}
   </div>
 }
 
@@ -2008,6 +2496,7 @@ function TopikiVideo({ src, autoAdvance, onAutoAdvanceChange, onEnded }: { src: 
   const controlsTimeoutRef = useRef<number | null>(null)
   const manuallyPausedRef = useRef(false)
   const [isPlaying, setIsPlaying] = useState(false)
+  const [playbackError, setPlaybackError] = useState(false)
   const [isTouchControlsVisible, setIsTouchControlsVisible] = useState(false)
   const [currentTime, setCurrentTime] = useState(0)
   const [duration, setDuration] = useState(0)
@@ -2018,7 +2507,14 @@ function TopikiVideo({ src, autoAdvance, onAutoAdvanceChange, onEnded }: { src: 
     const observer = new IntersectionObserver(([entry]) => {
       if (!entry) return
       if (entry.isIntersecting && entry.intersectionRatio >= 0.65 && !manuallyPausedRef.current) {
-        void video.play().then(() => setIsPlaying(true)).catch(() => setIsPlaying(false))
+        void video.play().then(() => {
+          setIsPlaying(true)
+          setPlaybackError(false)
+        }).catch(() => {
+          setIsPlaying(false)
+          setPlaybackError(true)
+          setIsTouchControlsVisible(true)
+        })
       } else {
         video.pause()
         setIsPlaying(false)
@@ -2047,7 +2543,11 @@ function TopikiVideo({ src, autoAdvance, onAutoAdvanceChange, onEnded }: { src: 
     if (!video) return
     if (video.paused) {
       manuallyPausedRef.current = false
-      void video.play().catch(() => setIsPlaying(false))
+      void video.play().then(() => setPlaybackError(false)).catch(() => {
+        setIsPlaying(false)
+        setPlaybackError(true)
+        setIsTouchControlsVisible(true)
+      })
     } else {
       manuallyPausedRef.current = true
       video.pause()
@@ -2073,17 +2573,27 @@ function TopikiVideo({ src, autoAdvance, onAutoAdvanceChange, onEnded }: { src: 
       muted
       loop={!autoAdvance}
       playsInline
-      preload="metadata"
+      autoPlay
+      preload="auto"
+      onError={() => {
+        setIsPlaying(false)
+        setPlaybackError(true)
+        setIsTouchControlsVisible(true)
+      }}
       onLoadedMetadata={(event) => setDuration(Number.isFinite(event.currentTarget.duration) ? event.currentTarget.duration : 0)}
       onDurationChange={(event) => setDuration(Number.isFinite(event.currentTarget.duration) ? event.currentTarget.duration : 0)}
       onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)}
-      onPlay={() => setIsPlaying(true)}
+      onPlay={() => {
+        setIsPlaying(true)
+        setPlaybackError(false)
+      }}
       onPause={() => setIsPlaying(false)}
       onEnded={() => {
         setIsPlaying(false)
         if (autoAdvance) onEnded()
       }}
     />
+    {playbackError && <p className="topiki-video-error" role="status">Nie można odtworzyć tego filmu. Dotknij przycisku, aby spróbować ponownie.</p>}
     <div className="topiki-video-controls" onClick={(event) => event.stopPropagation()}>
       <label className="topiki-auto-switch" title="Automatyczna zmiana Topików">
         <input type="checkbox" role="switch" checked={autoAdvance} onChange={(event) => onAutoAdvanceChange(event.target.checked)} aria-label="Automatyczna zmiana Topików" />
@@ -2140,7 +2650,7 @@ function SuggestedProfiles({ people, boostCounts, onOpen, onAdd, onDismiss }: { 
   </section>
 }
 
-function ProfileHeader({ person, isOwn, isCrewMember, isEditingProfile, nicknameDraft, firstNameDraft, middleNameDraft, lastNameDraft, secondLastNameDraft, locationDraft, contactPhoneDraft, secondContactPhoneDraft, bioDraft, avatarDraft, coverImageDraft, socialLinksDraft, profileVisibilityDraft, profileError, isSavingProfile, onEditProfile, onNicknameDraftChange, onFirstNameDraftChange, onMiddleNameDraftChange, onLastNameDraftChange, onSecondLastNameDraftChange, onLocationDraftChange, onContactPhoneDraftChange, onSecondContactPhoneDraftChange, onBioDraftChange, onSocialLinksDraftChange, onProfileVisibilityDraftChange, onImageChange, onSaveProfile, onCancelProfile, isCrewInvitationPending, isBandAdmin, onToggleCrew, onPromote, postCount }: {
+function ProfileHeader({ person, isOwn, isCrewMember, isEditingProfile, nicknameDraft, firstNameDraft, middleNameDraft, lastNameDraft, secondLastNameDraft, locationDraft, contactPhoneDraft, secondContactPhoneDraft, bioDraft, avatarDraft, coverImageDraft, socialLinksDraft, profileVisibilityDraft, profileError, isSavingProfile, onEditProfile, onNicknameDraftChange, onFirstNameDraftChange, onMiddleNameDraftChange, onLastNameDraftChange, onSecondLastNameDraftChange, onLocationDraftChange, onContactPhoneDraftChange, onSecondContactPhoneDraftChange, onBioDraftChange, onSocialLinksDraftChange, onProfileVisibilityDraftChange, onImageChange, onSaveProfile, onCancelProfile, isCrewInvitationPending, isBandAdmin, onToggleCrew, onPromote, onReportProfile, postCount }: {
   person: Person
   isOwn: boolean
   isCrewMember: boolean
@@ -2179,6 +2689,7 @@ function ProfileHeader({ person, isOwn, isCrewMember, isEditingProfile, nickname
   isBandAdmin: boolean
   onToggleCrew: () => void
   onPromote: () => void
+  onReportProfile: () => void
   postCount: number
 }) {
   const memberCount = person.crewMembers + Number(isCrewMember)
@@ -2188,8 +2699,8 @@ function ProfileHeader({ person, isOwn, isCrewMember, isEditingProfile, nickname
   const avatar = isEditingProfile && isOwn ? avatarDraft : person.avatar
   return <section className="profile-header">
     <div className="profile-cover" style={cover ? { backgroundImage: `linear-gradient(90deg, #18372655, #18372622), url("${cover}")` } : undefined}>{!cover && <span>YT</span>}{isOwn && isEditingProfile && <label className="profile-cover-upload">Zmień zdjęcie w tle<input type="file" accept="image/*" onChange={(event) => { const file = event.currentTarget.files?.[0]; if (file) void onImageChange('cover', file); event.currentTarget.value = '' }} /></label>}</div>
-    <div className="profile-details"><div className="profile-avatar-wrap"><img src={avatar} alt={person.name} />{isOwn && isEditingProfile && <label className="profile-avatar-upload">Zmień zdjęcie<input type="file" accept="image/*" onChange={(event) => { const file = event.currentTarget.files?.[0]; if (file) void onImageChange('avatar', file); event.currentTarget.value = '' }} /></label>}</div><div className="profile-buttons">{isOwn ? <button className="edit-profile" type="button" onClick={isEditingProfile ? onCancelProfile : onEditProfile}><Settings2 size={15} /> {isEditingProfile ? 'Anuluj edycję' : 'Edytuj profil'}</button> : <><button className={`follow-button ${isCrewMember ? 'following' : ''} ${isCrewInvitationPending ? 'invite-pending' : ''}`} onClick={onToggleCrew}>{isCrewMember ? <><X size={14} /> Usuń z Ekipy</> : isCrewInvitationPending ? <><X size={14} /> Anuluj zaproszenie</> : <><Plus size={14} /> Dodaj do Ekipy</>}</button><button className="promote-profile-button" onClick={onPromote}><ArrowUp size={14} /> Podbij profil</button></>}<button className="profile-more" aria-label="Więcej"><MoreHorizontal size={20} /></button></div>
-      <h2>{person.name}{isBandAdmin && <span className="admin-badge">Admin</span>}</h2><p className="profile-handle">@{person.nickname ?? person.handle}</p>
+    <div className="profile-details"><div className="profile-avatar-wrap"><img src={avatar} alt={person.name} />{isOwn && isEditingProfile && <label className="profile-avatar-upload">Zmień zdjęcie<input type="file" accept="image/*" onChange={(event) => { const file = event.currentTarget.files?.[0]; if (file) void onImageChange('avatar', file); event.currentTarget.value = '' }} /></label>}</div><div className="profile-buttons">{isOwn ? <button className="edit-profile" type="button" onClick={isEditingProfile ? onCancelProfile : onEditProfile}><Settings2 size={15} /> {isEditingProfile ? 'Anuluj edycję' : 'Edytuj profil'}</button> : <><button className={`follow-button ${isCrewMember ? 'following' : ''} ${isCrewInvitationPending ? 'invite-pending' : ''}`} onClick={onToggleCrew}>{isCrewMember ? <><X size={14} /> Usuń z Ekipy</> : isCrewInvitationPending ? <><X size={14} /> Anuluj zaproszenie</> : <><Plus size={14} /> Dodaj do Ekipy</>}</button><button className="promote-profile-button" onClick={onPromote}><ArrowUp size={14} /> Podbij profil</button></>}<button className="profile-more" type="button" onClick={person.id && !isOwn ? onReportProfile : undefined} aria-label={person.id && !isOwn ? 'Zgłoś profil' : 'Więcej'} title={person.id && !isOwn ? 'Zgłoś profil' : 'Więcej'}>{person.id && !isOwn ? <Flag size={18} /> : <MoreHorizontal size={20} />}</button></div>
+      <h2>{person.name}{person.profileVerified && <BadgeCheck className="verified-profile-badge" size={18} aria-label="Zweryfikowany profil" />}{isBandAdmin && <span className="admin-badge">Admin</span>}</h2><p className="profile-handle">@{person.nickname ?? person.handle}</p>
       {isOwn && isEditingProfile && <form className="profile-editor" onSubmit={onSaveProfile}>
         <div className="profile-name-fields">
           <label>Imię<input value={firstNameDraft} onChange={(event) => onFirstNameDraftChange(event.target.value)} maxLength={80} autoComplete="given-name" required /></label>
