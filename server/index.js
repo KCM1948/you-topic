@@ -75,6 +75,7 @@ app.use('/api', (request, response, next) => {
   if (request.path === '/health' || request.path.startsWith('/admin/')) return next()
   const ipHash = hashIp(request.ip)
   return readStore().then((store) => {
+    request.authStore = store
     const block = store.ipBlocks.find((item) => item.ipHash === ipHash && item.expiresAt > Date.now())
     if (block) return response.status(403).json({ error: 'Dostęp z tego adresu IP został czasowo zablokowany.' })
     next()
@@ -82,7 +83,7 @@ app.use('/api', (request, response, next) => {
 })
 
 function emptyStore() {
-  return { users: [], announcements: [], admins: [], rankPermissionTemplates: {}, reports: [], reportNotifications: [], moderatedItems: [], supportTickets: [], auditLog: [], platformSettings: { registrationEnabled: true }, deletedUsers: [], ipBlocks: [], socialPosts: [], socialMedia: [] }
+  return { users: [], announcements: [], admins: [], rankPermissionTemplates: {}, reports: [], reportNotifications: [], moderatedItems: [], supportTickets: [], auditLog: [], platformSettings: { registrationEnabled: true }, deletedUsers: [], ipBlocks: [], socialPosts: [], socialMedia: [], socialCrewLinks: [], socialCrewInvitations: [] }
 }
 
 function normalizeStore(store) {
@@ -118,6 +119,8 @@ function normalizeStore(store) {
     ipBlocks: Array.isArray(store.ipBlocks) ? store.ipBlocks : [],
     socialPosts: Array.isArray(store.socialPosts) ? store.socialPosts : [],
     socialMedia: Array.isArray(store.socialMedia) ? store.socialMedia : [],
+    socialCrewLinks: Array.isArray(store.socialCrewLinks) ? store.socialCrewLinks : [],
+    socialCrewInvitations: Array.isArray(store.socialCrewInvitations) ? store.socialCrewInvitations : [],
   }
 }
 
@@ -397,7 +400,7 @@ async function sendSms(phone, code, purpose = 'logowania') {
 const requireAuthentication = async (request, response, next) => {
   const session = sessionUserId(request)
   if (!session) return response.status(401).json({ error: 'Zaloguj się ponownie.' })
-  const store = await readStore()
+  const store = request.authStore ?? await readStore()
   const user = store.users.find((item) => item.id === session.sub)
   if (!user) return response.status(401).json({ error: 'Zaloguj się ponownie.' })
   if (isUserBlocked(user)) {
@@ -411,6 +414,8 @@ const requireAuthentication = async (request, response, next) => {
 
 const mediaUploadLimit = rateLimit({ windowMs: 60 * 60 * 1000, limit: 30, standardHeaders: true, legacyHeaders: false })
 const postCreationLimit = rateLimit({ windowMs: 60 * 60 * 1000, limit: 30, standardHeaders: true, legacyHeaders: false })
+const crewMutationLimit = rateLimit({ windowMs: 15 * 60 * 1000, limit: 40, standardHeaders: true, legacyHeaders: false })
+const socialDirectoryLimit = rateLimit({ windowMs: 60 * 1000, limit: 120, standardHeaders: true, legacyHeaders: false })
 
 function publicSocialPerson(user) {
   const visibility = user.profileVisibility ?? {}
@@ -471,8 +476,8 @@ function socialPostForUser(post, userId, users) {
   }
 }
 
-async function readSocialPosts(userId) {
-  const store = await readStore()
+async function readSocialPosts(userId, store = null) {
+  store ??= await readStore()
   if (database) {
     const { rows } = await database.query('SELECT id, author_id, data, liked_by, saved_by, boosted_by FROM youtopic_social_posts ORDER BY created_at DESC, id DESC LIMIT 200')
     return rows.map((row) => socialPostForUser({
@@ -557,6 +562,104 @@ app.get('/api/media/:mediaId', requireAuthentication, async (request, response) 
   return response.send(media.data)
 })
 
+app.get('/api/users', requireAuthentication, socialDirectoryLimit, async (request, response) => {
+  const query = typeof request.query.q === 'string' ? request.query.q.trim().toLocaleLowerCase('pl-PL') : ''
+  const store = request.authStore
+  const users = store.users
+    .filter((user) => user.id !== request.authUser.id && user.emailVerified === true && !isUserBlocked(user))
+    .map(publicSocialPerson)
+    .filter((user) => !query || `${user.name} ${user.handle} ${user.nickname}`.toLocaleLowerCase('pl-PL').includes(query))
+    .slice(0, 50)
+  return response.json({ users })
+})
+
+app.get('/api/crew', requireAuthentication, socialDirectoryLimit, async (request, response) => {
+  const store = request.authStore
+  const usersById = new Map(store.users.map((user) => [user.id, user]))
+  const links = store.socialCrewLinks
+    .filter((link) => link.firstUserId === request.authUser.id || link.secondUserId === request.authUser.id)
+    .map((link) => [usersById.get(link.firstUserId), usersById.get(link.secondUserId)])
+    .filter((pair) => pair.every(Boolean))
+    .map((pair) => pair.map((user) => defaultNickname(user)))
+  const invitations = store.socialCrewInvitations
+    .filter((invitation) => invitation.fromId === request.authUser.id || invitation.toId === request.authUser.id)
+    .map((invitation) => ({
+      id: invitation.id,
+      from: usersById.get(invitation.fromId),
+      to: usersById.get(invitation.toId),
+      status: invitation.status,
+      respondedAt: invitation.respondedAt,
+    }))
+    .filter((invitation) => invitation.from && invitation.to)
+    .map((invitation) => ({ ...invitation, from: publicSocialPerson(invitation.from), to: publicSocialPerson(invitation.to) }))
+  return response.json({ links, invitations })
+})
+
+app.post('/api/crew/invitations', requireAuthentication, crewMutationLimit, async (request, response) => {
+  const toUserId = typeof request.body?.toUserId === 'string' ? request.body.toUserId : ''
+  if (!toUserId || toUserId === request.authUser.id) return response.status(400).json({ error: 'Wybierz użytkownika, którego chcesz dodać do Ekipy.' })
+  const result = await updateStore((store) => {
+    const target = store.users.find((user) => user.id === toUserId && user.emailVerified === true && !isUserBlocked(user))
+    if (!target) return { error: 'Nie znaleziono aktywnego konta tego użytkownika.' }
+    const pair = [request.authUser.id, target.id].sort()
+    if (store.socialCrewLinks.some((link) => [link.firstUserId, link.secondUserId].sort().join(':') === pair.join(':'))) {
+      return { error: 'Jesteście już w swoich Ekipach.' }
+    }
+    const pending = store.socialCrewInvitations.find((invitation) =>
+      invitation.status === 'pending' && [invitation.fromId, invitation.toId].sort().join(':') === pair.join(':'))
+    if (pending) return { error: 'Zaproszenie do Ekipy już czeka na odpowiedź.' }
+    const invitation = { id: crypto.randomUUID(), fromId: request.authUser.id, toId: target.id, status: 'pending', createdAt: Date.now() }
+    store.socialCrewInvitations.push(invitation)
+    return { invitation: { ...invitation, from: publicSocialPerson(request.authUser), to: publicSocialPerson(target) } }
+  })
+  if (result.error) return response.status(409).json({ error: result.error })
+  return response.status(201).json(result)
+})
+
+app.post('/api/crew/invitations/:invitationId/respond', requireAuthentication, crewMutationLimit, async (request, response) => {
+  const accept = request.body?.accept
+  if (typeof accept !== 'boolean') return response.status(400).json({ error: 'Wybierz, czy akceptujesz zaproszenie.' })
+  const result = await updateStore((store) => {
+    const invitation = store.socialCrewInvitations.find((item) => item.id === request.params.invitationId && item.toId === request.authUser.id && item.status === 'pending')
+    if (!invitation) return { error: 'To zaproszenie nie jest już dostępne.' }
+    invitation.status = accept ? 'accepted' : 'declined'
+    invitation.respondedAt = Date.now()
+    if (accept && !store.socialCrewLinks.some((link) =>
+      [link.firstUserId, link.secondUserId].sort().join(':') === [invitation.fromId, invitation.toId].sort().join(':'))) {
+      store.socialCrewLinks.push({ firstUserId: invitation.fromId, secondUserId: invitation.toId })
+    }
+    return { ok: true }
+  })
+  if (result.error) return response.status(404).json({ error: result.error })
+  return response.json(result)
+})
+
+app.delete('/api/crew/invitations/:invitationId', requireAuthentication, crewMutationLimit, async (request, response) => {
+  const result = await updateStore((store) => {
+    const invitation = store.socialCrewInvitations.find((item) => item.id === request.params.invitationId && item.fromId === request.authUser.id && item.status === 'pending')
+    if (!invitation) return { error: 'Nie znaleziono oczekującego zaproszenia.' }
+    invitation.status = 'cancelled'
+    invitation.respondedAt = Date.now()
+    return { ok: true }
+  })
+  if (result.error) return response.status(404).json({ error: result.error })
+  return response.json(result)
+})
+
+app.delete('/api/crew/:handle', requireAuthentication, crewMutationLimit, async (request, response) => {
+  const result = await updateStore((store) => {
+    const target = store.users.find((user) => defaultNickname(user) === request.params.handle)
+    if (!target || target.id === request.authUser.id) return { error: 'Nie znaleziono użytkownika.' }
+    const before = store.socialCrewLinks.length
+    store.socialCrewLinks = store.socialCrewLinks.filter((link) =>
+      !((link.firstUserId === request.authUser.id && link.secondUserId === target.id)
+        || (link.secondUserId === request.authUser.id && link.firstUserId === target.id)))
+    return store.socialCrewLinks.length < before ? { ok: true } : { error: 'Nie jesteście w swoich Ekipach.' }
+  })
+  if (result.error) return response.status(404).json({ error: result.error })
+  return response.json(result)
+})
+
 app.delete('/api/media/:mediaId', requireAuthentication, async (request, response) => {
   const mediaId = request.params.mediaId
   if (!/^[\da-f-]{36}$/i.test(mediaId)) return response.status(404).json({ error: 'Nie znaleziono pliku.' })
@@ -589,7 +692,7 @@ app.delete('/api/media/:mediaId', requireAuthentication, async (request, respons
 })
 
 app.get('/api/posts', requireAuthentication, async (request, response) => {
-  return response.json({ posts: await readSocialPosts(request.authUser.id) })
+  return response.json({ posts: await readSocialPosts(request.authUser.id, request.authStore) })
 })
 
 app.post('/api/posts', requireAuthentication, postCreationLimit, async (request, response) => {
@@ -815,8 +918,8 @@ app.use('/api/admin', (request, response, next) => {
 
 app.get('/api/health', (_request, response) => response.json({ ok: true }))
 
-app.get('/api/announcements', requireAuthentication, async (_request, response) => {
-  const store = await readStore()
+app.get('/api/announcements', requireAuthentication, async (request, response) => {
+  const store = request.authStore
   const now = Date.now()
   response.set('Cache-Control', 'no-store')
   return response.json({
@@ -1340,7 +1443,7 @@ app.patch('/api/admin/reports/:id/decision', requireAdminAuthentication, require
 })
 
 app.get('/api/report-notifications', requireAuthentication, async (request, response) => {
-  const store = await readStore()
+  const store = request.authStore
   response.set('Cache-Control', 'no-store')
   return response.json({
     notifications: store.reportNotifications
@@ -1351,8 +1454,8 @@ app.get('/api/report-notifications', requireAuthentication, async (request, resp
   })
 })
 
-app.get('/api/moderation/removed-content', requireAuthentication, async (_request, response) => {
-  const store = await readStore()
+app.get('/api/moderation/removed-content', requireAuthentication, async (request, response) => {
+  const store = request.authStore
   response.set('Cache-Control', 'no-store')
   return response.json({
     items: store.moderatedItems.map(({ targetType, targetId, targetUserId }) => ({ targetType, targetId, targetUserId })),
@@ -1360,7 +1463,7 @@ app.get('/api/moderation/removed-content', requireAuthentication, async (_reques
 })
 
 app.get('/api/support/tickets', requireAuthentication, async (request, response) => {
-  const store = await readStore()
+  const store = request.authStore
   const tickets = store.supportTickets
     .filter((ticket) => ticket.userId === request.authUser.id)
     .sort((first, second) => second.updatedAt - first.updatedAt)

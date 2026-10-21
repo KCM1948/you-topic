@@ -179,9 +179,7 @@ const storageKeys = {
   users: 'youtopic-users',
   feedPosts: 'youtopic-feed-posts',
   followedTopics: (handle: string) => `youtopic-followed-topics-${handle}`,
-  crewLinks: 'youtopic-crew-links',
   chatMessages: 'youtopic-chat-messages',
-  crewInvitations: 'youtopic-crew-invitations',
   dismissedAnnouncements: 'youtopic-dismissed-announcements',
 }
 
@@ -213,7 +211,7 @@ type ChatMessage = {
 }
 
 type CrewInvitation = {
-  id: number
+  id: string
   from: Person
   to: Person
   status: 'pending' | 'accepted' | 'declined' | 'cancelled'
@@ -221,6 +219,17 @@ type CrewInvitation = {
 }
 
 type CrewLink = [string, string]
+type NavigationSnapshot = {
+  youtopic: true
+  guard?: boolean
+  view: View
+  homeTab: 'board' | 'chat' | 'band'
+  chatMode: 'public' | 'room'
+  activeChatHandle: string
+  selectedTopic: string
+  profileHandle: string
+  search: string
+}
 
 type View = 'home' | 'explore' | 'topiki' | 'crew' | 'band' | 'notifications' | 'support' | 'saved' | 'profile'
 
@@ -328,14 +337,18 @@ async function resizeProfileImage(file: File, maxDimension: number) {
   try {
     const scale = Math.min(1, maxDimension / Math.max(bitmap.width, bitmap.height))
     const canvas = document.createElement('canvas')
-    canvas.width = Math.max(1, Math.round(bitmap.width * scale))
-    canvas.height = Math.max(1, Math.round(bitmap.height * scale))
     const context = canvas.getContext('2d')
     if (!context) throw new Error('Nie udało się przygotować zdjęcia.')
-    context.drawImage(bitmap, 0, 0, canvas.width, canvas.height)
-    const image = canvas.toDataURL('image/jpeg', 0.82)
-    if (image.length > 900_000) throw new Error('Zdjęcie jest nadal zbyt duże. Wybierz mniejszy plik.')
-    return image
+    for (const dimensionScale of [1, 0.9, 0.8]) {
+      canvas.width = Math.max(1, Math.round(bitmap.width * scale * dimensionScale))
+      canvas.height = Math.max(1, Math.round(bitmap.height * scale * dimensionScale))
+      context.drawImage(bitmap, 0, 0, canvas.width, canvas.height)
+      for (const quality of [0.84, 0.8, 0.76, 0.72]) {
+        const image = canvas.toDataURL('image/jpeg', quality)
+        if (image.length <= 900_000) return image
+      }
+    }
+    throw new Error('Zdjęcie jest nadal zbyt duże. Wybierz mniejszy plik.')
   } finally {
     bitmap.close()
   }
@@ -386,6 +399,9 @@ function App() {
 
   useEffect(() => {
     let active = true
+    const loadingFallback = window.setTimeout(() => {
+      if (active) setAuthReady(true)
+    }, 900)
     fetch('/api/auth/me', { credentials: 'include' })
       .then(async (response) => response.ok ? response.json() as Promise<{ user: Person }> : null)
       .then((result) => {
@@ -394,7 +410,10 @@ function App() {
         setAuthReady(true)
       })
       .catch(() => { if (active) setAuthReady(true) })
-    return () => { active = false }
+    return () => {
+      active = false
+      window.clearTimeout(loadingFallback)
+    }
   }, [])
 
   if (!authReady) return <main className="auth-loading"><img src="/youtopic-mark.svg" alt="" /><span>Ładowanie YouTopic...</span></main>
@@ -413,7 +432,7 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
   const [selectedTopic, setSelectedTopic] = useState('')
   const [posts, setPosts] = useState(() => [...loadStored<Post[]>(storageKeys.feedPosts, initialPosts), ...loadStored<Post[]>(storageKeys.bandPosts, [])])
   const [allUsers, setAllUsers] = useState(() => mergePeople(people, loadStored<Person[]>(storageKeys.users, []), [currentUser]))
-  const [crewLinks, setCrewLinks] = useState(() => loadStored<CrewLink[]>(storageKeys.crewLinks, []))
+  const [crewLinks, setCrewLinks] = useState<CrewLink[]>([])
   const [bands, setBands] = useState(() => loadStored<Band[]>(storageKeys.bands, []))
   const [activeBandId, setActiveBandId] = useState('')
   const [isCreatingBand, setIsCreatingBand] = useState(false)
@@ -445,6 +464,8 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
   const [voiceDraft, setVoiceDraft] = useState<{ postId: number; url: string; audioData: string; audioType: string; duration: number; blob: Blob } | null>(null)
   const [openComments, setOpenComments] = useState<number[]>([])
   const [search, setSearch] = useState('')
+  const [platformUsers, setPlatformUsers] = useState<Person[]>([currentUser])
+  const [userSearchResults, setUserSearchResults] = useState<Person[]>([])
   const [profile, setProfile] = useState<Person>(currentUser)
   const [profileBoostTarget, setProfileBoostTarget] = useState<Person | null>(null)
   const [notice, setNotice] = useState('')
@@ -460,7 +481,7 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
   const [activeChatHandle, setActiveChatHandle] = useState('')
   const [chatMode, setChatMode] = useState<'public' | 'room'>('public')
   const [chatMessages, setChatMessages] = useState(() => loadStored<ChatMessage[]>(storageKeys.chatMessages, initialChatMessages))
-  const [crewInvitations, setCrewInvitations] = useState(() => loadStored<CrewInvitation[]>(storageKeys.crewInvitations, []))
+  const [crewInvitations, setCrewInvitations] = useState<CrewInvitation[]>([])
   const [dismissedSuggestions, setDismissedSuggestions] = useState<string[]>(() => loadStored<string[]>(`youtopic-dismissed-suggestions-${currentUser.handle}`, []))
   const [chatDraft, setChatDraft] = useState('')
   const [followedTopics, setFollowedTopics] = useState(() => loadStored<string[]>(storageKeys.followedTopics(currentUser.handle), []))
@@ -484,6 +505,8 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
   const [socialLinksDraft, setSocialLinksDraft] = useState<SocialProfileLink[]>(() => Object.entries(currentUser.socialLinks ?? {}).map(([platform, url], index) => ({ id: index, platform: platform as SocialPlatform, url })))
   const [profileVisibilityDraft, setProfileVisibilityDraft] = useState<ProfileVisibilitySettings>(() => ({ ...defaultProfileVisibility, ...currentUser.profileVisibility, contactPhone: currentUser.profileVisibility?.contactPhone ?? 'private', secondContactPhone: currentUser.profileVisibility?.secondContactPhone ?? 'private' }))
   const fileInput = useRef<HTMLInputElement>(null)
+  const searchInputRef = useRef<HTMLInputElement>(null)
+  const linkedProfileHandledRef = useRef(false)
   const storyFileInput = useRef<HTMLInputElement>(null)
   const storyTextInput = useRef<HTMLInputElement>(null)
   const personalStoryFileInput = useRef<HTMLInputElement>(null)
@@ -494,6 +517,18 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
   const voiceStartedAtRef = useRef(0)
   const voiceCancelledRef = useRef(false)
   const storyTouchStartXRef = useRef<number | null>(null)
+  const allUsersRef = useRef(allUsers)
+  allUsersRef.current = allUsers
+  const navigationRef = useRef<NavigationSnapshot>({
+    youtopic: true,
+    view,
+    homeTab,
+    chatMode,
+    activeChatHandle,
+    selectedTopic,
+    profileHandle: profile.handle,
+    search,
+  })
 
   useEffect(() => {
     let active = true
@@ -610,7 +645,7 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
     if (post.profileTarget) counts.set(post.profileTarget.handle, (counts.get(post.profileTarget.handle) ?? 0) + 1)
     return counts
   }, new Map<string, number>())
-  const suggestedProfiles = allUsers
+  const suggestedProfiles = platformUsers
     .filter((person) => person.handle !== currentUser.handle && !crewHandles.includes(person.handle) && !dismissedSuggestions.includes(person.handle) && !suppressedSuggestionHandles.includes(person.handle))
     .sort((first, second) => (profileBoostCounts.get(second.handle) ?? 0) - (profileBoostCounts.get(first.handle) ?? 0))
   const band = accessibleBands.find((item) => item.id === activeBandId) ?? accessibleBands[0] ?? null
@@ -684,6 +719,101 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
       : view === 'explore' || view === 'topiki' || view === 'crew' || view === 'saved' || view === 'profile'
 
   useEffect(() => {
+    let active = true
+    const refreshSocialDirectory = async () => {
+      try {
+        const [{ users }, crew] = await Promise.all([
+          authRequest<{ users: Person[] }>('/api/users'),
+          authRequest<{ links: CrewLink[]; invitations: CrewInvitation[] }>('/api/crew'),
+        ])
+        if (!active) return
+        const peopleOnPlatform = mergePeople(users, [currentUser])
+        setPlatformUsers(peopleOnPlatform)
+        setAllUsers((current) => mergePeople(people, current, peopleOnPlatform))
+        setCrewLinks(crew.links)
+        setCrewInvitations(crew.invitations)
+      } catch (error: unknown) {
+        if (active) setNotice(error instanceof Error ? error.message : 'Nie udało się pobrać kont i zaproszeń z serwera.')
+      }
+    }
+    void refreshSocialDirectory()
+    const timer = window.setInterval(() => { void refreshSocialDirectory() }, 30_000)
+    const refreshOnFocus = () => { if (document.visibilityState === 'visible') void refreshSocialDirectory() }
+    document.addEventListener('visibilitychange', refreshOnFocus)
+    return () => {
+      active = false
+      window.clearInterval(timer)
+      document.removeEventListener('visibilitychange', refreshOnFocus)
+    }
+  }, [currentUser.id, currentUser.handle])
+
+  useEffect(() => {
+    const query = search.trim()
+    if (!query) {
+      setUserSearchResults([])
+      return
+    }
+    let active = true
+    const timer = window.setTimeout(() => {
+      authRequest<{ users: Person[] }>(`/api/users?q=${encodeURIComponent(query)}`)
+        .then(({ users }) => { if (active) setUserSearchResults(users) })
+        .catch((error: unknown) => {
+          if (active) setNotice(error instanceof Error ? error.message : 'Nie udało się wyszukać użytkowników.')
+        })
+    }, 250)
+    return () => {
+      active = false
+      window.clearTimeout(timer)
+    }
+  }, [search])
+
+  useEffect(() => {
+    const handleSearchShortcut = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLocaleLowerCase() === 'k') {
+        event.preventDefault()
+        searchInputRef.current?.focus()
+      }
+    }
+    window.addEventListener('keydown', handleSearchShortcut)
+    return () => window.removeEventListener('keydown', handleSearchShortcut)
+  }, [])
+
+  useEffect(() => {
+    const onPopState = (event: PopStateEvent) => {
+      const snapshot = event.state as Partial<NavigationSnapshot> | null
+      if (snapshot?.youtopic && snapshot.guard) {
+        const current = { ...snapshot, guard: false } as NavigationSnapshot
+        navigationRef.current = current
+        window.history.pushState(current, '', window.location.href)
+        return
+      }
+      if (!snapshot?.youtopic || !snapshot.view || !snapshot.homeTab) {
+        window.history.pushState(navigationRef.current, '', window.location.href)
+        return
+      }
+      const restored = snapshot as NavigationSnapshot
+      navigationRef.current = restored
+      setView(restored.view)
+      setHomeTab(restored.homeTab)
+      setChatMode(restored.chatMode)
+      setActiveChatHandle(restored.activeChatHandle)
+      setSelectedTopic(restored.selectedTopic)
+      setSearch(restored.search)
+      setProfile(allUsersRef.current.find((person) => person.handle === restored.profileHandle) ?? currentUser)
+      if (restored.view === 'topiki') setActiveTopikiIndex(0)
+    }
+    window.history.replaceState({ ...navigationRef.current, guard: true }, '', window.location.href)
+    window.history.pushState(navigationRef.current, '', window.location.href)
+    window.addEventListener('popstate', onPopState)
+    return () => window.removeEventListener('popstate', onPopState)
+  }, [currentUser])
+
+  useEffect(() => {
+    navigationRef.current = { ...navigationRef.current, view, homeTab, chatMode, activeChatHandle, selectedTopic, profileHandle: profile.handle, search }
+    window.history.replaceState(navigationRef.current, '', window.location.href)
+  }, [activeChatHandle, chatMode, homeTab, profile.handle, search, selectedTopic, view])
+
+  useEffect(() => {
     saveStored(storageKeys.bands, bands)
   }, [bands])
 
@@ -692,16 +822,8 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
   }, [allUsers])
 
   useEffect(() => {
-    saveStored(storageKeys.crewLinks, crewLinks)
-  }, [crewLinks])
-
-  useEffect(() => {
     saveStored(storageKeys.chatMessages, chatMessages)
   }, [chatMessages])
-
-  useEffect(() => {
-    saveStored(storageKeys.crewInvitations, crewInvitations)
-  }, [crewInvitations])
 
   useEffect(() => {
     saveStored(`youtopic-auto-advance-topiki-${currentUser.handle}`, autoAdvanceTopiki)
@@ -720,9 +842,15 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
   }, [currentUser.handle, feedMode])
 
   useEffect(() => {
+    if (linkedProfileHandledRef.current) return
     const profileHandle = new URLSearchParams(window.location.search).get('profile')
     const linkedProfile = profileHandle ? allUsers.find((person) => person.handle === profileHandle) : null
     if (linkedProfile) {
+      linkedProfileHandledRef.current = true
+      const url = new URL(window.location.href)
+      url.searchParams.delete('profile')
+      window.history.replaceState(window.history.state, '', url)
+      pushNavigation({ view: 'profile', profileHandle: linkedProfile.handle, search: '' })
       setProfile(linkedProfile)
       setView('profile')
     }
@@ -764,9 +892,7 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
       if (event.key === storageKeys.bandPosts) setPosts([...initialPosts, ...loadStored<Post[]>(storageKeys.bandPosts, [])])
       if (event.key === storageKeys.bandStories) setBandStories(loadStored<BandStory[]>(storageKeys.bandStories, []).filter((story) => story.expiresAt > Date.now()))
       if (event.key === storageKeys.users) setAllUsers(mergePeople(people, loadStored<Person[]>(storageKeys.users, []), [currentUser]))
-      if (event.key === storageKeys.crewLinks) setCrewLinks(loadStored<CrewLink[]>(storageKeys.crewLinks, []))
       if (event.key === storageKeys.chatMessages) setChatMessages(loadStored<ChatMessage[]>(storageKeys.chatMessages, initialChatMessages))
-      if (event.key === storageKeys.crewInvitations) setCrewInvitations(loadStored<CrewInvitation[]>(storageKeys.crewInvitations, []))
       if (event.key === storageKeys.feedPosts) setPosts([...loadStored<Post[]>(storageKeys.feedPosts, initialPosts), ...loadStored<Post[]>(storageKeys.bandPosts, [])])
     }
     window.addEventListener('storage', syncSharedBands)
@@ -794,6 +920,10 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
     }
     return [...topics.values()].sort((first, second) => second.count - first.count || first.name.localeCompare(second.name, 'pl'))
   }, [posts])
+  const matchingUsers = userSearchResults.slice(0, 5)
+  const matchingTopics = search.trim()
+    ? topicCatalog.filter((topic) => topic.name.toLocaleLowerCase('pl-PL').includes(search.trim().toLocaleLowerCase('pl-PL'))).slice(0, 4)
+    : []
   const sidebarTopics = [...topicCatalog].sort((first, second) => Number(followedTopics.includes(normalizeTopicName(second.name))) - Number(followedTopics.includes(normalizeTopicName(first.name))) || second.count - first.count).slice(0, 4)
 
   const filteredPosts = useMemo(() => {
@@ -846,7 +976,22 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
     return () => observer.disconnect()
   }, [filteredPosts, pendingTopikiPostId, view])
 
+  function pushNavigation(patch: Partial<Omit<NavigationSnapshot, 'youtopic'>>) {
+    const next = { ...navigationRef.current, ...patch, youtopic: true as const }
+    if (Object.keys(patch).every((key) => next[key as keyof NavigationSnapshot] === navigationRef.current[key as keyof NavigationSnapshot])) return
+    navigationRef.current = next
+    window.history.pushState(next, '', window.location.href)
+  }
+
   function showView(nextView: View) {
+    pushNavigation({
+      view: nextView,
+      homeTab: nextView === 'home' ? 'board' : navigationRef.current.homeTab,
+      chatMode: 'public',
+      selectedTopic: '',
+      profileHandle: currentUser.handle,
+      search: '',
+    })
     setView(nextView)
     setSearch('')
     setSelectedTopic('')
@@ -880,6 +1025,7 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
   }
 
   function openTopic(topic: string) {
+    pushNavigation({ view: 'explore', homeTab: 'board', selectedTopic: topic, profileHandle: currentUser.handle, search: '' })
     setView('explore')
     setHomeTab('board')
     setSearch('')
@@ -902,6 +1048,7 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
 
   function openTopikiFromPost(postId: number) {
     if (!topikiPosts.some((post) => post.id === postId)) return
+    pushNavigation({ view: 'topiki', search: '' })
     setPendingTopikiPostId(postId)
     setActiveTopikiIndex(topikiPosts.findIndex((post) => post.id === postId))
     setSearch('')
@@ -909,7 +1056,9 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
   }
 
   function openProfile(person: Person) {
-    setProfile(allUsers.find((candidate) => candidate.handle === person.handle) ?? person)
+    const selectedProfile = allUsers.find((candidate) => candidate.handle === person.handle) ?? person
+    pushNavigation({ view: 'profile', profileHandle: selectedProfile.handle, search: '' })
+    setProfile(selectedProfile)
     setView('profile')
     setSearch('')
   }
@@ -961,6 +1110,7 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
 
   function boostProfileOnBoard(person: Person) {
     if (person.handle === currentUser.handle) return
+    pushNavigation({ view: 'home', homeTab: 'board', profileHandle: currentUser.handle, selectedTopic: '', search: '' })
     setPosts((current) => [{
       id: Date.now(),
       author: currentUser,
@@ -981,35 +1131,46 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
     window.setTimeout(() => setNotice(''), 2600)
   }
 
-  function toggleCrew(person: Person) {
+  async function toggleCrew(person: Person) {
     const isMember = crewHandles.includes(person.handle)
     if (isMember) {
-      setCrewLinks((current) => current.filter((link) => crewPairKey(link[0], link[1]) !== crewPairKey(currentUser.handle, person.handle)))
-      setNotice(`Usunięto ${person.name} z Ekipy`)
+      try {
+        await authDelete<{ ok: true }>(`/api/crew/${encodeURIComponent(person.handle)}`)
+        setCrewLinks((current) => current.filter((link) => crewPairKey(link[0], link[1]) !== crewPairKey(currentUser.handle, person.handle)))
+        setNotice(`Usunięto ${person.name} z Ekipy`)
+      } catch (error: unknown) {
+        setNotice(error instanceof Error ? error.message : 'Nie udało się usunąć osoby z Ekipy.')
+      }
     } else {
       const pending = crewInvitations.find((invitation) => invitation.from.handle === currentUser.handle && invitation.to.handle === person.handle && invitation.status === 'pending')
-      if (pending) cancelCrewInvitation(person)
+      if (pending) await cancelCrewInvitation(person)
       else sendCrewInvitation(person)
       return
     }
     window.setTimeout(() => setNotice(''), 2600)
   }
 
-  function cancelCrewInvitation(person: Person) {
+  async function cancelCrewInvitation(person: Person) {
     const invitation = crewInvitations.find((item) => item.from.handle === currentUser.handle && item.to.handle === person.handle && item.status === 'pending')
     if (!invitation) return
-    setCrewInvitations((current) => current.map((item) => item.id === invitation.id ? { ...item, status: 'cancelled' } : item))
-    setNotice(`Anulowano zaproszenie dla ${person.name}`)
+    try {
+      await authDelete<{ ok: true }>(`/api/crew/invitations/${encodeURIComponent(invitation.id)}`)
+      setCrewInvitations((current) => current.map((item) => item.id === invitation.id ? { ...item, status: 'cancelled' } : item))
+      setNotice(`Anulowano zaproszenie dla ${person.name}`)
+    } catch (error: unknown) {
+      setNotice(error instanceof Error ? error.message : 'Nie udało się anulować zaproszenia.')
+    }
     window.setTimeout(() => setNotice(''), 2600)
   }
 
   function openChatRoom(person: Person) {
+    pushNavigation({ view: 'home', homeTab: 'chat', chatMode: 'room', activeChatHandle: person.handle })
     setActiveChatHandle(person.handle)
     setChatMode('room')
     setChatDraft('')
   }
 
-  function sendCrewInvitation(person: Person) {
+  async function sendCrewInvitation(person: Person) {
     if (crewHandles.includes(person.handle)) return
     const alreadyPending = crewInvitations.some((invitation) => invitation.status === 'pending' && crewPairKey(invitation.from.handle, invitation.to.handle) === crewPairKey(currentUser.handle, person.handle))
     if (alreadyPending) {
@@ -1017,8 +1178,18 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
       window.setTimeout(() => setNotice(''), 2600)
       return
     }
-    setCrewInvitations((current) => [...current, { id: Date.now(), from: currentUser, to: person, status: 'pending' }])
-    setNotice(`Wysłano zaproszenie do Ekipy dla ${person.name}`)
+    if (!person.id) {
+      setNotice('Tego profilu demonstracyjnego nie można dodać do Ekipy. Wyszukaj konto zarejestrowane na platformie.')
+      window.setTimeout(() => setNotice(''), 3500)
+      return
+    }
+    try {
+      const { invitation } = await authRequest<{ invitation: CrewInvitation }>('/api/crew/invitations', { toUserId: person.id })
+      setCrewInvitations((current) => [...current.filter((item) => item.id !== invitation.id), invitation])
+      setNotice(`Wysłano zaproszenie do Ekipy dla ${person.name}`)
+    } catch (error: unknown) {
+      setNotice(error instanceof Error ? error.message : 'Nie udało się wysłać zaproszenia.')
+    }
     window.setTimeout(() => setNotice(''), 2600)
   }
 
@@ -1068,6 +1239,7 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
       const updatedUser = result.user
       onCurrentUserUpdate(updatedUser)
       setAllUsers((current) => mergePeople(current, [updatedUser]))
+      setPlatformUsers((current) => mergePeople(current, [updatedUser]))
       const refreshPerson = (person: Person) => person.handle === updatedUser.handle ? updatedUser : person
       setPosts((current) => current.map((post) => ({
         ...post,
@@ -1142,14 +1314,19 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
     }
   }
 
-  function respondToCrewInvitation(invitationId: number, accept: boolean) {
+  async function respondToCrewInvitation(invitationId: string, accept: boolean) {
     const invitation = crewInvitations.find((item) => item.id === invitationId)
     if (!invitation) return
-    setCrewInvitations((current) => current.map((item) => item.id === invitationId ? { ...item, status: accept ? 'accepted' : 'declined', respondedAt: Date.now() } : item))
-    if (accept) {
-      setCrewLinks((current) => current.some((link) => crewPairKey(link[0], link[1]) === crewPairKey(invitation.from.handle, invitation.to.handle))
-        ? current
-        : [...current, [invitation.from.handle, invitation.to.handle]])
+    try {
+      await authRequest<{ ok: true }>(`/api/crew/invitations/${encodeURIComponent(invitationId)}/respond`, { accept })
+      setCrewInvitations((current) => current.map((item) => item.id === invitationId ? { ...item, status: accept ? 'accepted' : 'declined', respondedAt: Date.now() } : item))
+      if (accept) {
+        setCrewLinks((current) => current.some((link) => crewPairKey(link[0], link[1]) === crewPairKey(invitation.from.handle, invitation.to.handle))
+          ? current
+          : [...current, [invitation.from.handle, invitation.to.handle]])
+      }
+    } catch (error: unknown) {
+      setNotice(error instanceof Error ? error.message : 'Nie udało się odpowiedzieć na zaproszenie.')
     }
   }
 
@@ -1646,6 +1823,7 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
     }, ...current])
     setActiveBandId(targetBand.id)
     setShareBandPostId(null)
+    pushNavigation({ view: 'home', homeTab: 'band', chatMode: 'public' })
     setView('home')
     setHomeTab('band')
     setNotice(`Post udostępniono w Bandzie „${targetBand.name}”`)
@@ -1676,11 +1854,37 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
           <span>You<span className="brand-accent">Topic</span></span>
           <span className="beta-badge">beta</span>
         </a>
-        <label className="search-box">
-          <Search size={17} strokeWidth={1.8} />
-          <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Szukaj ludzi, tematów..." />
-          <kbd>⌘ K</kbd>
-        </label>
+        <div className="search-area">
+          <label className="search-box">
+            <Search size={17} strokeWidth={1.8} />
+            <input ref={searchInputRef} value={search} onChange={(event) => setSearch(event.target.value)} onKeyDown={(event) => {
+              if (event.key === 'Enter' && matchingUsers[0]) openProfile(matchingUsers[0])
+              if (event.key === 'Escape') setSearch('')
+            }} placeholder="Szukaj ludzi, tematów..." aria-label="Szukaj użytkowników i tematów" autoComplete="off" />
+            <kbd>⌘ K</kbd>
+          </label>
+          {search.trim() && <div className="search-results" role="listbox" aria-label="Wyniki wyszukiwania">
+            <div className="search-results-section">
+              <strong>UŻYTKOWNICY</strong>
+              {matchingUsers.map((person) => {
+                const isMember = crewHandles.includes(person.handle)
+                const isPending = crewInvitations.some((invitation) => invitation.from.handle === currentUser.handle && invitation.to.handle === person.handle && invitation.status === 'pending')
+                return <div className="search-user-result" key={person.handle}>
+                  <button className="search-user-open" onClick={() => openProfile(person)}>
+                    <img src={person.avatar} alt="" />
+                    <span><strong>{person.name}</strong><small>@{person.handle}</small></span>
+                  </button>
+                  <button className="search-user-add" disabled={isMember || isPending} onClick={() => void sendCrewInvitation(person)}>{isMember ? 'W Ekipie' : isPending ? 'Wysłano' : <><Plus size={13} /> Dodaj</>}</button>
+                </div>
+              })}
+              {matchingUsers.length === 0 && <p className="search-results-empty">Nie znaleziono użytkownika o tej nazwie.</p>}
+            </div>
+            {matchingTopics.length > 0 && <div className="search-results-section">
+              <strong>TEMATY</strong>
+              {matchingTopics.map((topic) => <button className="search-topic-result" key={normalizeTopicName(topic.name)} onClick={() => openTopic(topic.name)}><span>#</span>{topic.name}<small>{topic.count}</small></button>)}
+            </div>}
+          </div>}
+        </div>
         <div className="topbar-actions">
           <button className="icon-button notification-top" aria-label="Powiadomienia" onClick={() => showView('notifications')}><Bell size={19} /><i /></button>
           <button className="profile-chip" onClick={() => openProfile(currentUser)}>
@@ -1748,9 +1952,9 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
             {view !== 'topiki' && <button className="filter-button"><Settings2 size={16} /> Najnowsze <ChevronDown size={14} /></button>}
           </div>
           {view === 'home' && <div className="home-tabs" role="tablist" aria-label="Widok główny">
-            <button className={homeTab === 'board' ? 'active' : ''} role="tab" aria-selected={homeTab === 'board'} onClick={() => setHomeTab('board')}><Home size={16} /> Tablica</button>
-            <button className={homeTab === 'chat' ? 'active' : ''} role="tab" aria-selected={homeTab === 'chat'} onClick={() => { setChatMode('public'); setHomeTab('chat') }}><MessageCircle size={16} /> Chat<span>{chatContacts.length}</span></button>
-            <button className={homeTab === 'band' ? 'active' : ''} role="tab" aria-selected={homeTab === 'band'} onClick={() => { setIsCreatingBand(false); setHomeTab('band'); if (band) markBandSeen(band.id) }}><LockKeyhole size={15} /> Banda{unreadBandCount > 0 && <span className="home-band-count">{unreadBandCount > 9 ? '9+' : unreadBandCount}</span>}</button>
+            <button className={homeTab === 'board' ? 'active' : ''} role="tab" aria-selected={homeTab === 'board'} onClick={() => { pushNavigation({ view: 'home', homeTab: 'board', chatMode: 'public' }); setHomeTab('board') }}><Home size={16} /> Tablica</button>
+            <button className={homeTab === 'chat' ? 'active' : ''} role="tab" aria-selected={homeTab === 'chat'} onClick={() => { pushNavigation({ view: 'home', homeTab: 'chat', chatMode: 'public' }); setChatMode('public'); setHomeTab('chat') }}><MessageCircle size={16} /> Chat<span>{chatContacts.length}</span></button>
+            <button className={homeTab === 'band' ? 'active' : ''} role="tab" aria-selected={homeTab === 'band'} onClick={() => { pushNavigation({ view: 'home', homeTab: 'band', chatMode: 'public' }); setIsCreatingBand(false); setHomeTab('band'); if (band) markBandSeen(band.id) }}><LockKeyhole size={15} /> Banda{unreadBandCount > 0 && <span className="home-band-count">{unreadBandCount > 9 ? '9+' : unreadBandCount}</span>}</button>
           </div>}
           {view === 'home' && homeTab === 'board' && <div className="feed-mode-tabs" role="tablist" aria-label="Zakres tablicy">
             <button className={feedMode === 'for-you' ? 'active' : ''} role="tab" aria-selected={feedMode === 'for-you'} onClick={() => setFeedMode('for-you')}>Dla Ciebie</button>
@@ -1822,7 +2026,7 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
               </div>
               <form className="chat-public-composer" onSubmit={sendPublicChatMessage}><input value={chatDraft} onChange={(event) => setChatDraft(event.target.value)} placeholder="Napisz do wszystkich..." aria-label="Wiadomość publiczna" /><button type="submit" disabled={!chatDraft.trim()} aria-label="Wyślij wiadomość"><Send size={17} /></button></form>
             </> : activeChat ? <section className="chat-private-room">
-              <header className="chat-room-header"><button className="room-back-button" onClick={() => setChatMode('public')} aria-label="Wróć do czatu publicznego"><ChevronDown size={18} /></button><button className="chat-person-button" onClick={() => openProfile(activeChat)}><img src={activeChat.avatar} alt="" /><span><strong>{activeChat.name}</strong><small>@{activeChat.handle}</small></span></button><span className="outside-badge">Pokój prywatny</span></header>
+              <header className="chat-room-header"><button className="room-back-button" onClick={() => window.history.back()} aria-label="Wróć do czatu publicznego"><ChevronDown size={18} /></button><button className="chat-person-button" onClick={() => openProfile(activeChat)}><img src={activeChat.avatar} alt="" /><span><strong>{activeChat.name}</strong><small>@{activeChat.handle}</small></span></button><span className="outside-badge">Pokój prywatny</span></header>
               {activeRoomInvitation?.to.handle === currentUser.handle && <div className="room-invitation-banner">{activeRoomInvitation.from.name} zaprasza Cię do Ekipy.<button onClick={() => respondToCrewInvitation(activeRoomInvitation.id, true)}>Akceptuj</button><button className="decline-invite" onClick={() => respondToCrewInvitation(activeRoomInvitation.id, false)}>Odrzuć</button></div>}
               {activeRoomInvitation?.from.handle === currentUser.handle && <div className="room-invitation-status">Zaproszenie do Ekipy czeka na odpowiedź.</div>}
               <div className="chat-room-messages" aria-live="polite">
@@ -1924,12 +2128,13 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
 
           {view === 'crew' && <section className="crew-panel">
             <div className="section-caption">TWOJA EKIPA <span>{crewHandles.length} w Ekipie</span></div>
-            {allUsers.filter((person) => person.handle !== currentUser.handle).map((person) => {
+            {platformUsers.filter((person) => person.handle !== currentUser.handle).map((person) => {
               const isMember = crewHandles.includes(person.handle)
               const isPending = crewInvitations.some((invitation) => invitation.from.handle === currentUser.handle && invitation.to.handle === person.handle && invitation.status === 'pending')
               const memberCount = person.crewMembers + Number(isMember)
               return <div className="crew-row" key={person.handle}><button className="crew-person" onClick={() => openProfile(person)}><img src={person.avatar} alt="" /><span><strong>{person.name}</strong><small>@{person.handle} · {memberCount} Ekipowiczów</small></span></button><button className={`follow-button ${isMember ? 'following' : ''} ${isPending ? 'invite-pending' : ''}`} onClick={() => toggleCrew(person)}>{isMember ? <><X size={14} /> Usuń z Ekipy</> : isPending ? <><X size={14} /> Anuluj zaproszenie</> : <><Plus size={14} /> Dodaj do Ekipy</>}</button></div>
             })}
+            {platformUsers.filter((person) => person.handle !== currentUser.handle).length === 0 && <p className="crew-empty">Nie znaleziono jeszcze innych kont. Skorzystaj z wyszukiwarki, gdy pojawią się nowi użytkownicy.</p>}
           </section>}
 
           {view === 'notifications' && <section className="notifications-panel">
@@ -2169,6 +2374,13 @@ async function authRequest<T>(path: string, payload?: unknown): Promise<T> {
   })
   const result = await response.json().catch(() => ({})) as T & { error?: string }
   if (!response.ok) throw new Error(result.error || 'Nie udało się połączyć z serwerem.')
+  return result
+}
+
+async function authDelete<T>(path: string): Promise<T> {
+  const response = await fetch(path, { method: 'DELETE', credentials: 'include' })
+  const result = await response.json().catch(() => ({})) as T & { error?: string }
+  if (!response.ok) throw new Error(result.error || 'Nie udało się zapisać zmiany.')
   return result
 }
 
