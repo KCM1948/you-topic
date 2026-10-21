@@ -138,10 +138,13 @@ type BandStory = {
   seenPeople?: Person[]
 }
 
+type PersonalStory = Omit<BandStory, 'bandId'>
+
 const storageKeys = {
   bands: 'youtopic-bands',
   bandPosts: 'youtopic-band-posts',
   bandStories: 'youtopic-band-stories',
+  personalStories: 'youtopic-personal-stories',
   users: 'youtopic-users',
   feedPosts: 'youtopic-feed-posts',
   followedTopics: (handle: string) => `youtopic-followed-topics-${handle}`,
@@ -162,8 +165,9 @@ function loadStored<T>(key: string, fallback: T): T {
 function saveStored(key: string, value: unknown) {
   try {
     window.localStorage.setItem(key, JSON.stringify(value))
+    return true
   } catch {
-    return
+    return false
   }
 }
 
@@ -376,8 +380,13 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
   const [selectedBandHandles, setSelectedBandHandles] = useState<string[]>([])
   const [shareBandPostId, setShareBandPostId] = useState<number | null>(null)
   const [bandStories, setBandStories] = useState(() => loadStored<BandStory[]>(storageKeys.bandStories, []).filter((story) => story.expiresAt > Date.now()))
+  const [personalStories, setPersonalStories] = useState(() => loadStored<PersonalStory[]>(storageKeys.personalStories, []).filter((story) => story.expiresAt > Date.now()))
   const [storyDraft, setStoryDraft] = useState('')
   const [storyMedia, setStoryMedia] = useState<{ url: string; kind: 'image' | 'video' } | null>(null)
+  const [isComposingPersonalStory, setIsComposingPersonalStory] = useState(false)
+  const [personalStoryDraft, setPersonalStoryDraft] = useState('')
+  const [personalStoryMedia, setPersonalStoryMedia] = useState('')
+  const [personalStoryError, setPersonalStoryError] = useState('')
   const [activeStoryId, setActiveStoryId] = useState<number | null>(null)
   const [clockNow, setClockNow] = useState(Date.now())
   const [openViewers, setOpenViewers] = useState<number | null>(null)
@@ -424,6 +433,7 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
   const fileInput = useRef<HTMLInputElement>(null)
   const storyFileInput = useRef<HTMLInputElement>(null)
   const storyTextInput = useRef<HTMLInputElement>(null)
+  const personalStoryFileInput = useRef<HTMLInputElement>(null)
   const topikiFeedRef = useRef<HTMLDivElement>(null)
   const voiceRecorderRef = useRef<MediaRecorder | null>(null)
   const voiceStreamRef = useRef<MediaStream | null>(null)
@@ -465,7 +475,8 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
   const bandMembers = band ? allUsers.filter((person) => band.memberHandles.includes(person.handle)) : []
   const bandPosts = band ? posts.filter((post) => post.bandId === band.id) : []
   const currentBandStories = bandStories.filter((story) => story.bandId === band?.id && story.expiresAt > clockNow)
-  const viewedStory = currentBandStories.find((story) => story.id === activeStoryId)
+  const currentPersonalStories = personalStories.filter((story) => story.expiresAt > clockNow && (story.author.handle === currentUser.handle || crewHandles.includes(story.author.handle)))
+  const viewedStory = currentBandStories.find((story) => story.id === activeStoryId) ?? currentPersonalStories.find((story) => story.id === activeStoryId)
   const unreadBandCount = accessibleBands.reduce((count, item) => {
     const itemPosts = item.id === band?.id ? bandPosts : posts.filter((post) => post.bandId === item.id)
     return count + itemPosts.filter((post) => post.author.handle !== currentUser.handle && !post.seenBy?.includes(currentUser.handle)).length
@@ -541,6 +552,10 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
       .map((story) => story.media?.startsWith('blob:') ? { ...story, media: undefined, mediaKind: undefined } : story)
     saveStored(storageKeys.bandStories, savedStories)
   }, [bandStories, clockNow])
+
+  useEffect(() => {
+    saveStored(storageKeys.personalStories, personalStories.filter((story) => story.expiresAt > clockNow))
+  }, [personalStories, clockNow])
 
   useEffect(() => {
     const timer = window.setInterval(() => setClockNow(Date.now()), 60_000)
@@ -805,6 +820,24 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
       const updatedUser = result.user
       onCurrentUserUpdate(updatedUser)
       setAllUsers((current) => mergePeople(current, [updatedUser]))
+      const refreshPerson = (person: Person) => person.handle === updatedUser.handle ? updatedUser : person
+      setPosts((current) => current.map((post) => ({
+        ...post,
+        author: refreshPerson(post.author),
+        comments: post.comments.map((comment) => typeof comment === 'string' ? comment : { ...comment, author: refreshPerson(comment.author) }),
+        sharedFrom: post.sharedFrom ? { ...post.sharedFrom, author: refreshPerson(post.sharedFrom.author) } : undefined,
+        profileTarget: post.profileTarget ? refreshPerson(post.profileTarget) : undefined,
+      })))
+      setBandStories((current) => current.map((story) => ({
+        ...story,
+        author: refreshPerson(story.author),
+        seenPeople: story.seenPeople?.map(refreshPerson),
+      })))
+      setPersonalStories((current) => current.map((story) => ({
+        ...story,
+        author: refreshPerson(story.author),
+        seenPeople: story.seenPeople?.map(refreshPerson),
+      })))
       setProfile((current) => current.handle === updatedUser.handle ? updatedUser : current)
       setNicknameDraft(updatedUser.nickname ?? updatedUser.handle)
       setFirstNameDraft(updatedUser.firstName ?? '')
@@ -851,8 +884,11 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
     setProfileError('')
     try {
       const image = await resizeProfileImage(file, kind === 'avatar' ? 512 : 1600)
-      if (kind === 'avatar') setAvatarDraft(image)
-      else setCoverImageDraft(image)
+      if (kind === 'avatar') {
+        setAvatarDraft(image)
+        setNotice('Podgląd zdjęcia gotowy — kliknij „Zapisz profil”, aby zachować zmianę.')
+        window.setTimeout(() => setNotice(''), 3500)
+      } else setCoverImageDraft(image)
     } catch (error) {
       setProfileError(error instanceof Error ? error.message : 'Nie udało się wczytać zdjęcia.')
     }
@@ -944,6 +980,50 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
     }, ...current])
     setStoryDraft('')
     setStoryMedia(null)
+  }
+
+  async function choosePersonalStoryMedia(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0]
+    event.target.value = ''
+    if (!file) return
+    setPersonalStoryError('')
+    try {
+      setPersonalStoryMedia(await resizeProfileImage(file, 720))
+    } catch (error) {
+      setPersonalStoryError(error instanceof Error ? error.message : 'Nie udało się wczytać zdjęcia.')
+    }
+  }
+
+  function publishPersonalStory(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    const text = personalStoryDraft.trim()
+    if (!text && !personalStoryMedia) return
+    const nextStories = [{
+      id: Date.now(),
+      author: currentUser,
+      text,
+      media: personalStoryMedia || undefined,
+      mediaKind: personalStoryMedia ? 'image' as const : undefined,
+      expiresAt: Date.now() + 24 * 60 * 60 * 1000,
+      seenBy: [currentUser.handle],
+      seenPeople: [currentUser],
+    }, ...personalStories.filter((story) => story.expiresAt > Date.now())]
+    if (!saveStored(storageKeys.personalStories, nextStories)) {
+      setPersonalStoryError('Nie udało się zapisać relacji w tej przeglądarce. Wybierz mniejsze zdjęcie lub zwolnij miejsce w pamięci przeglądarki.')
+      return
+    }
+    setPersonalStories(nextStories)
+    setPersonalStoryDraft('')
+    setPersonalStoryMedia('')
+    setPersonalStoryError('')
+    setIsComposingPersonalStory(false)
+  }
+
+  function openPersonalStory(storyId: number) {
+    setActiveStoryId(storyId)
+    setPersonalStories((current) => current.map((story) => story.id === storyId
+      ? { ...story, seenBy: [...new Set([...story.seenBy, currentUser.handle])], seenPeople: [...(story.seenPeople ?? []).filter((person) => person.handle !== currentUser.handle), currentUser] }
+      : story))
   }
 
   function openBandStory(storyId: number) {
@@ -1276,17 +1356,23 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
 
           {view === 'home' && homeTab === 'board' && (
             <section className="stories" aria-label="Relacje Ekipy">
-              <button className="story story-add" onClick={() => openProfile(currentUser)}>
-                <span className="story-ring own-story"><img src={currentUser.avatar} alt="" /><i><Plus size={14} /></i></span>
-                <span>Twoja relacja</span>
+              <button className="story story-add" type="button" onClick={() => {
+                const ownStory = currentPersonalStories.find((story) => story.author.handle === currentUser.handle)
+                if (ownStory) openPersonalStory(ownStory.id)
+                else {
+                  setPersonalStoryError('')
+                  setIsComposingPersonalStory(true)
+                }
+              }}>
+                <span className={`story-ring ${currentPersonalStories.some((story) => story.author.handle === currentUser.handle) ? 'story-tone-2' : 'own-story'}`}><img src={currentUser.avatar} alt="" />{!currentPersonalStories.some((story) => story.author.handle === currentUser.handle) && <i><Plus size={14} /></i>}</span>
+                <span>{currentPersonalStories.some((story) => story.author.handle === currentUser.handle) ? 'Twoja relacja' : 'Dodaj relację'}</span>
               </button>
-              {allUsers.filter((person) => crewHandles.includes(person.handle)).map((person, index) => (
-                <button className="story" key={person.handle} onClick={() => openProfile(person)}>
-                  <span className={`story-ring story-tone-${index}`}><img src={person.avatar} alt="" /></span>
-                  <span>{person.name.split(' ')[0]}</span>
+              {currentPersonalStories.filter((story, index, stories) => story.author.handle !== currentUser.handle && stories.findIndex((item) => item.author.handle === story.author.handle) === index).map((story, index) => (
+                <button className="story" key={story.author.handle} type="button" onClick={() => openPersonalStory(story.id)}>
+                  <span className={`story-ring story-tone-${index % 3}`}><img src={story.author.avatar} alt="" /></span>
+                  <span>{story.author.name.split(' ')[0]}</span>
                 </button>
               ))}
-              <button className="story-next" aria-label="Następne relacje"><ChevronDown size={17} /></button>
             </section>
           )}
 
@@ -1571,10 +1657,22 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
           <footer className="right-footer">Informacje <span>·</span> Prywatność <span>·</span> Regulamin<br />© 2026 YouTopic</footer>
         </aside>
       </div>
+      {isComposingPersonalStory && <div className="personal-story-backdrop" onClick={() => setIsComposingPersonalStory(false)}>
+        <section className="personal-story-dialog" role="dialog" aria-modal="true" aria-labelledby="personal-story-title" onClick={(event) => event.stopPropagation()}>
+          <header><div><strong id="personal-story-title">Dodaj relację</strong><small>Zniknie po 24 godzinach</small></div><button type="button" onClick={() => setIsComposingPersonalStory(false)} aria-label="Zamknij"><X size={18} /></button></header>
+          <form onSubmit={publishPersonalStory}>
+            <textarea autoFocus value={personalStoryDraft} onChange={(event) => setPersonalStoryDraft(event.target.value)} placeholder="Podziel się chwilą z Ekipą..." maxLength={280} aria-label="Treść relacji" />
+            {personalStoryMedia && <div className="personal-story-preview"><img src={personalStoryMedia} alt="Podgląd zdjęcia relacji" /><button type="button" onClick={() => setPersonalStoryMedia('')} aria-label="Usuń zdjęcie"><X size={16} /></button></div>}
+            <input ref={personalStoryFileInput} type="file" accept="image/*" onChange={(event) => void choosePersonalStoryMedia(event)} hidden />
+            {personalStoryError && <p className="profile-editor-error" role="alert">{personalStoryError}</p>}
+            <footer><button type="button" className="personal-story-photo" onClick={() => personalStoryFileInput.current?.click()}><Image size={16} /> Dodaj zdjęcie</button><button type="submit" className="story-publish-button" disabled={!personalStoryDraft.trim() && !personalStoryMedia}>Opublikuj relację</button></footer>
+          </form>
+        </section>
+      </div>}
       {viewedStory && <div className="story-viewer-backdrop" onClick={() => setActiveStoryId(null)}>
-        <section className="story-viewer" role="dialog" aria-modal="true" aria-label={`Relacja: ${viewedStory.author.name}`} onClick={(event) => event.stopPropagation()}>
+        <section className={`story-viewer ${viewedStory.media ? 'has-media' : ''}`} role="dialog" aria-modal="true" aria-label={`Relacja: ${viewedStory.author.name}`} onClick={(event) => event.stopPropagation()}>
           <header><span><img src={viewedStory.author.avatar} alt="" />{viewedStory.author.name}</span><button onClick={() => setActiveStoryId(null)} aria-label="Zamknij relację"><X size={18} /></button></header>
-          {viewedStory.media && viewedStory.mediaKind === 'image' && <img className="story-viewer-media" src={viewedStory.media} alt="Relacja członka bandy" />}
+          {viewedStory.media && viewedStory.mediaKind === 'image' && <img className="story-viewer-media" src={viewedStory.media} alt="Zdjęcie w relacji" />}
           {viewedStory.media && viewedStory.mediaKind === 'video' && <video className="story-viewer-media" src={viewedStory.media} controls autoPlay />}
           {viewedStory.text && <p>{viewedStory.text}</p>}
           <footer><button className="story-view-count" onClick={() => setOpenViewers(openViewers === -viewedStory.id ? null : -viewedStory.id)}><Eye size={14} />{viewedStory.seenBy.length} wyświetleń</button>
@@ -1582,6 +1680,7 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
               const viewer = handle === currentUser.handle ? currentUser : viewedStory.seenPeople?.find((person) => person.handle === handle) ?? people.find((person) => person.handle === handle)
               return viewer && <span key={handle}><img src={viewer.avatar} alt="" />{viewer.name}</span>
             })}</div>}
+            {viewedStory.author.handle === currentUser.handle && <button className="story-view-count" onClick={() => { setActiveStoryId(null); setIsComposingPersonalStory(true) }}><Plus size={14} />Dodaj kolejną relację</button>}
           </footer>
         </section>
       </div>}
@@ -1953,7 +2052,6 @@ function TopikiVideo({ src, autoAdvance, onAutoAdvanceChange, onEnded }: { src: 
       manuallyPausedRef.current = true
       video.pause()
     }
-        <span className="beta-badge">beta</span>
   }
 
   return <div
@@ -1964,10 +2062,6 @@ function TopikiVideo({ src, autoAdvance, onAutoAdvanceChange, onEnded }: { src: 
     onPointerEnter={(event) => {
       if (event.pointerType === 'mouse') setIsTouchControlsVisible(true)
     }}
-        <aside className="beta-announcement" role="note">
-          <strong>Wersja beta</strong>
-          <span>Serwis jest w fazie testów. Możesz napotkać błędy lub niepełne funkcje.</span>
-        </aside>
     onPointerLeave={(event) => {
       if (event.pointerType === 'mouse') setIsTouchControlsVisible(false)
     }}

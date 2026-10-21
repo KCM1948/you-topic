@@ -319,7 +319,8 @@ h1 { margin: 0; font-family: var(--font-display); font-size: 25px; line-height: 
 .post-viewer-list > span img { width: 23px; height: 23px; border-radius: 50%; object-fit: cover; }
 .post-viewer-list > small { color: #8a9085; font-size: 9px; }
 .story-viewer-backdrop { position: fixed; z-index: 12; inset: 0; display: grid; place-items: center; padding: 20px; background: #142019b8; }
-.story-viewer { display: grid; grid-template-rows: auto minmax(200px, 58vh) auto auto; width: min(100%, 400px); max-height: 88vh; overflow: hidden; border-radius: 7px; background: #fff; }
+.story-viewer { display: grid; grid-template-rows: auto auto auto; width: min(100%, 400px); max-height: 88vh; overflow: auto; border-radius: 7px; background: #fff; }
+.story-viewer.has-media { grid-template-rows: auto minmax(200px, 58vh) auto auto; overflow: hidden; }
 .story-viewer > header { display: flex; align-items: center; justify-content: space-between; min-height: 48px; padding: 7px 11px; }
 .story-viewer > header > span { display: flex; align-items: center; gap: 7px; font-size: 10px; font-weight: 700; }
 .story-viewer > header img { width: 28px; height: 28px; border-radius: 50%; object-fit: cover; }
@@ -331,6 +332,22 @@ h1 { margin: 0; font-family: var(--font-display); font-size: 25px; line-height: 
 .story-viewer-list { display: flex; gap: 8px; max-width: 62%; margin-left: auto; overflow-x: auto; }
 .story-viewer-list span { display: inline-flex; align-items: center; gap: 4px; color: #666d62; font-size: 8px; white-space: nowrap; }
 .story-viewer-list img { width: 19px; height: 19px; border-radius: 50%; object-fit: cover; }
+.personal-story-backdrop { position: fixed; z-index: 13; inset: 0; display: grid; place-items: center; padding: 18px; background: #1420199c; }
+.personal-story-dialog { display: grid; gap: 12px; width: min(100%, 440px); padding: 15px; border: 1px solid #e3e8dd; border-radius: 7px; background: white; box-shadow: 0 14px 42px #111b142e; }
+.personal-story-dialog > header { display: flex; align-items: center; justify-content: space-between; }
+.personal-story-dialog > header > div { display: grid; gap: 4px; }
+.personal-story-dialog > header strong { color: #2c3529; font-family: var(--font-display); font-size: 14px; }
+.personal-story-dialog > header small { color: #858c80; font-size: 9px; }
+.personal-story-dialog > header button, .personal-story-preview button { display: grid; place-items: center; width: 30px; height: 30px; border: 0; border-radius: 50%; background: #f1f3ee; color: #73796f; }
+.personal-story-dialog form { display: grid; gap: 10px; }
+.personal-story-dialog textarea { min-height: 100px; resize: vertical; padding: 10px; border: 1px solid #e2e6dd; border-radius: 5px; outline: 0; color: var(--ink); font-size: 12px; line-height: 1.5; }
+.personal-story-dialog textarea:focus { border-color: #91b569; }
+.personal-story-preview { position: relative; justify-self: start; max-width: 100%; }
+.personal-story-preview img { display: block; max-width: 100%; max-height: 220px; border-radius: 5px; object-fit: contain; }
+.personal-story-preview button { position: absolute; top: 6px; right: 6px; background: #111a; color: white; }
+.personal-story-dialog form > footer { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.personal-story-photo { display: inline-flex; align-items: center; gap: 6px; min-height: 32px; padding: 0 9px; border: 1px solid #e1e7da; border-radius: 4px; background: #f7faf4; color: #527546; font-size: 10px; font-weight: 700; }
+.personal-story-dialog .story-publish-button { min-height: 32px; padding-inline: 12px; font-size: 10px; }
 .profile-boost-backdrop { position: fixed; z-index: 13; inset: 0; display: grid; place-items: center; padding: 18px; background: #1420199c; }
 .profile-boost-dialog { display: grid; gap: 10px; width: min(100%, 360px); padding: 14px; border: 1px solid #e3e8dd; border-radius: 7px; background: white; box-shadow: 0 14px 42px #111b142e; }
 .profile-boost-dialog > header { display: flex; align-items: center; justify-content: space-between; padding-bottom: 4px; color: #2c3529; font-family: var(--font-display); font-size: 13px; }
@@ -617,14 +634,16 @@ h1 { margin: 0; font-family: var(--font-display); font-size: 25px; line-height: 
 .profile-avatar-wrap { position: relative; width: 75px; height: 75px; margin-top: -37px; }
 .profile-avatar-wrap > img { width: 75px; height: 75px; border: 4px solid white; border-radius: 50%; object-fit: cover; }
 .profile-avatar-upload, .profile-cover-upload { position: absolute; z-index: 2; display: inline-flex; align-items: center; justify-content: center; border: 1px solid #ffffffa8; border-radius: 5px; background: #193a2ddd; color: #fff; font-size: 9px; font-weight: 700; cursor: pointer; }
-.profile-avatar-upload { right: -5px; bottom: -3px; width: 27px; height: 27px; overflow: hidden; font-size: 0; }
-.profile-avatar-upload::before { content: '✎'; font-size: 14px; }
+.profile-avatar-upload { right: -8px; bottom: -3px; min-height: 27px; gap: 4px; padding: 0 7px; white-space: nowrap; font-size: 8px; }
+.profile-avatar-upload::before { content: '✎'; font-size: 12px; }
 .profile-cover-upload { top: 10px; left: 12px; min-height: 29px; padding: 0 9px; }
-.profile-avatar-upload input, .profile-cover-upload input { position: absolute; width: 1px; height: 1px; opacity: 0; }
+.profile-avatar-upload input, .profile-cover-upload input { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; cursor: pointer; }
+.profile-avatar-upload:focus-within, .profile-cover-upload:focus-within { outline: 2px solid #b8ef58; outline-offset: 2px; }
 .profile-buttons { position: absolute; top: 10px; right: 16px; display: flex; gap: 7px; }
 .edit-profile { height: 31px; }
 .profile-more { border: 1px solid #e6e8e2; border-radius: 5px; }
 .profile-details h2 { margin: 10px 0 2px; font-family: var(--font-display); font-size: 18px; }
+.verified-profile-badge { margin-left: 5px; vertical-align: -3px; color: #3182c8; }
 .profile-handle { margin: 0; color: #92968e; font-size: 10px; }
 .profile-editor { display: grid; gap: 11px; width: min(100%, 480px); margin: 13px 0 16px; padding: 13px; border: 1px solid #e9ece4; border-radius: 7px; background: #fbfcf9; }
 .profile-editor > label { display: grid; gap: 5px; color: #596450; font-size: 10px; font-weight: 700; }
@@ -740,6 +759,14 @@ h1 { margin: 0; font-family: var(--font-display); font-size: 25px; line-height: 
 .auth-switch button:hover { text-decoration: underline; }
 .auth-demo-note { margin: 37px 0 0; padding-top: 15px; border-top: 1px solid #e8ebe4; color: #9a9f96; font-size: 10px; line-height: 1.6; text-align: center; }
 .auth-test-hint { margin: -7px 0 0; color: #7d8d6d; font-size: 9px; line-height: 1.5; }
+
+@media (min-width: 701px) and (max-width: 820px) {
+  .auth-screen { grid-template-columns: minmax(0, 1fr); }
+  .auth-brand-panel { min-height: 300px; padding: 30px clamp(24px, 7vw, 64px) 22px; }
+  .auth-brand-message { margin: 22px 0 14px; padding: 0; }
+  .auth-brand-message h1 { font-size: 38px; }
+  .auth-form-panel { min-height: 0; padding: 38px 24px; }
+}
 
 @media (max-width: 1120px) {
   .topbar { grid-template-columns: 205px minmax(240px, 1fr) auto; gap: 18px; padding-inline: 24px; }
