@@ -2,6 +2,7 @@ import { Fragment, useEffect, useMemo, useRef, useState, type ChangeEvent, type 
 import {
   Bookmark,
   BadgeCheck,
+  Ban,
   BellOff,
   ArrowUp,
   Check,
@@ -36,6 +37,7 @@ import {
   Square,
   Trash2,
   UsersRound,
+  UserRound,
   Video,
   X,
   Bell,
@@ -159,11 +161,12 @@ type ReportNotification = {
 type SocialNotification = {
   id: string
   actor: Person | null
-  type: 'like' | 'boost' | 'comment' | 'comment_like' | 'crew_invitation' | 'crew_accepted' | 'chat_message'
+  type: 'like' | 'boost' | 'comment' | 'comment_like' | 'crew_invitation' | 'crew_accepted' | 'chat_message' | 'chat_request' | 'chat_request_accepted' | 'support_reply'
   message: string
   postId?: string
   chatHandle?: string
   crewInvitationId?: string
+  ticketId?: string
   createdAt: number
   readAt: number | null
 }
@@ -256,6 +259,19 @@ type ChatMessage = {
   text: string
   time: string
   createdAt: number
+  mediaUrl?: string
+  mediaType?: string
+  temporarySeconds?: number
+  expiresAt?: number
+}
+
+type ChatRequest = {
+  id: string
+  status: 'pending' | 'accepted' | 'declined'
+  direction: 'incoming' | 'outgoing'
+  person: Person
+  createdAt: number
+  latestMessage: ChatMessage | null
 }
 
 const phoneDialCodes = [
@@ -308,7 +324,7 @@ type SupportTicket = {
   id: string
   subject: string
   category: 'account' | 'technical' | 'security' | 'idea' | 'other'
-  status: 'open' | 'in_progress' | 'resolved'
+  status: 'open' | 'in_progress' | 'resolved' | 'closed'
   messages: Array<{ id: string; authorType: 'user' | 'admin'; authorName: string; message: string; createdAt: number }>
   createdAt: number
   updatedAt: number
@@ -508,6 +524,9 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
   const [supportCategory, setSupportCategory] = useState<SupportTicket['category']>('account')
   const [supportMessage, setSupportMessage] = useState('')
   const [supportBusy, setSupportBusy] = useState(false)
+  const [supportReplies, setSupportReplies] = useState<Record<string, string>>({})
+  const [supportReplyBusy, setSupportReplyBusy] = useState('')
+  const [supportFocusTicketId, setSupportFocusTicketId] = useState('')
   const [moderatedItems, setModeratedItems] = useState<ModeratedItem[]>([])
   const [dismissedAnnouncements, setDismissedAnnouncements] = useState<string[]>(() => loadStored<string[]>(storageKeys.dismissedAnnouncements, []))
   const [activeChatHandle, setActiveChatHandle] = useState('')
@@ -516,6 +535,11 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
   const [chatMode, setChatMode] = useState<'public' | 'room'>('public')
   const [roomMinimized, setRoomMinimized] = useState(false)
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([])
+  const [chatRequests, setChatRequests] = useState<ChatRequest[]>([])
+  const [chatPeopleSearch, setChatPeopleSearch] = useState('')
+  const [chatImageDraft, setChatImageDraft] = useState<{ file: File; preview: string; temporarySeconds: number } | null>(null)
+  const [showChatEmojiPicker, setShowChatEmojiPicker] = useState(false)
+  const [chatClockNow, setChatClockNow] = useState(Date.now())
   const [crewInvitations, setCrewInvitations] = useState<CrewInvitation[]>([])
   const [dismissedSuggestions, setDismissedSuggestions] = useState<string[]>(() => loadStored<string[]>(`youtopic-dismissed-suggestions-${currentUser.handle}`, []))
   const [chatDraft, setChatDraft] = useState('')
@@ -541,6 +565,7 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
   const [profileVisibilityDraft, setProfileVisibilityDraft] = useState<ProfileVisibilitySettings>(() => ({ ...defaultProfileVisibility, ...currentUser.profileVisibility, contactPhone: currentUser.profileVisibility?.contactPhone ?? 'private', secondContactPhone: currentUser.profileVisibility?.secondContactPhone ?? 'private' }))
   const [socialPrivacyDraft, setSocialPrivacyDraft] = useState<SocialPrivacy>(() => ({ profileAudience: currentUser.socialPrivacy?.profileAudience ?? 'public', crewInviteAudience: currentUser.socialPrivacy?.crewInviteAudience ?? 'everyone' }))
   const fileInput = useRef<HTMLInputElement>(null)
+  const chatImageInput = useRef<HTMLInputElement>(null)
   const searchInputRef = useRef<HTMLInputElement>(null)
   const linkedProfileHandledRef = useRef(false)
   const storyFileInput = useRef<HTMLInputElement>(null)
@@ -681,6 +706,11 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
   }, [view])
 
   useEffect(() => {
+    if (view !== 'support' || !supportFocusTicketId || !supportTickets.some((ticket) => ticket.id === supportFocusTicketId)) return
+    document.getElementById(`support-ticket-${supportFocusTicketId}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+  }, [supportFocusTicketId, supportTickets, view])
+
+  useEffect(() => {
     let active = true
     const refreshModeration = async () => {
       try {
@@ -726,6 +756,14 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
     item.targetType === 'message' && item.targetId === `message:${message.id}` && item.targetUserId === message.author.id)
   const publicChatMessages = chatMessages.filter((message) => message.scope === 'public' && !isMessageModerated(message) && !isBlockedUser(message.author))
   const roomMessages = chatMessages.filter((message) => message.scope === 'room' && !isMessageModerated(message) && activeChat && ((message.author.handle === currentUser.handle && message.recipientHandle === activeChat.handle) || (message.author.handle === activeChat.handle && message.recipientHandle === currentUser.handle)))
+  const activeChatRequest = activeChat ? chatRequests.find((request) => request.person.handle === activeChat.handle && request.status === 'pending') : undefined
+  const hasAcceptedPrivateRoom = Boolean(activeChat && (crewHandles.includes(activeChat.handle)
+    || chatRequests.some((request) => request.person.handle === activeChat.handle && request.status === 'accepted')))
+  const incomingChatRequests = chatRequests.filter((request) => request.direction === 'incoming' && request.status === 'pending')
+  const discoverableChatPeople = platformUsers
+    .filter((person) => person.id && person.handle !== currentUser.handle && !isBlockedUser(person)
+      && (`${person.nickname ?? person.handle} ${person.name}`).toLocaleLowerCase('pl-PL').includes(chatPeopleSearch.trim().toLocaleLowerCase('pl-PL')))
+    .slice(0, 12)
   const incomingCrewInvitations = crewInvitations.filter((invitation) => invitation.to.handle === currentUser.handle && invitation.status === 'pending')
   const unreadNotificationCount = socialNotifications.filter((notification) => !notification.readAt).length
   const unreadChatCounts = socialNotifications.reduce((counts, notification) => {
@@ -899,9 +937,36 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
   }, [chatMode, currentUser.id, homeTab, view])
 
   useEffect(() => {
+    if (view !== 'home' || homeTab !== 'chat') return
+    let active = true
+    const refreshChatRequests = async () => {
+      try {
+        const { requests } = await authRequest<{ requests: ChatRequest[] }>('/api/chat/requests')
+        if (active) setChatRequests(requests)
+      } catch (error: unknown) {
+        if (active) setNotice(error instanceof Error ? error.message : 'Nie udało się odświeżyć zaproszeń do czatu.')
+      }
+    }
+    void refreshChatRequests()
+    const timer = window.setInterval(() => { if (document.visibilityState === 'visible') void refreshChatRequests() }, 10_000)
+    return () => {
+      active = false
+      window.clearInterval(timer)
+    }
+  }, [currentUser.id, homeTab, view])
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setChatClockNow(Date.now()), 250)
+    return () => window.clearInterval(timer)
+  }, [])
+
+  useEffect(() => {
     let active = true
     if (view !== 'home' || homeTab !== 'chat' || !activeChatHandle || (chatMode !== 'room' && !roomMinimized)) return
-    if (!crewLinks.some((link) => crewPairKey(link[0], link[1]) === crewPairKey(currentUser.handle, activeChatHandle))) return
+    const chatPerson = allUsers.find((person) => person.handle === activeChatHandle)
+    const isCrewChat = crewLinks.some((link) => crewPairKey(link[0], link[1]) === crewPairKey(currentUser.handle, activeChatHandle))
+    const isAcceptedRequest = chatRequests.some((request) => request.person.handle === activeChatHandle && request.status === 'accepted')
+    if (!chatPerson || (!isCrewChat && !isAcceptedRequest)) return
     const refreshRoom = async () => {
       try {
         const { messages } = await authRequest<{ messages: ChatMessage[] }>(`/api/chat?scope=room&with=${encodeURIComponent(activeChatHandle)}`)
@@ -921,7 +986,7 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
       active = false
       window.clearInterval(timer)
     }
-  }, [activeChatHandle, chatMode, crewLinks, currentUser.handle, homeTab, roomMinimized, view])
+  }, [activeChatHandle, allUsers, chatMode, chatRequests, crewLinks, currentUser.handle, homeTab, roomMinimized, view])
 
   useEffect(() => {
     let active = true
@@ -1103,7 +1168,7 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
         result = followedTopics.length
           ? result.filter((post) => followedTopics.includes(normalizeTopicName(post.topic)))
           : []
-      } else if (view === 'home' || view === 'crew') {
+      } else if (view === 'crew') {
         result = result.filter((post) => post.author.handle === currentUser.handle || crewHandles.includes(post.author.handle) || post.boostedBy?.some((handle) => handle === currentUser.handle || crewHandles.includes(handle)))
       }
     }
@@ -1196,6 +1261,21 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
       setNotice(error instanceof Error ? error.message : 'Nie udało się wysłać sprawy.')
     } finally {
       setSupportBusy(false)
+    }
+  }
+
+  async function replyToSupportTicket(ticket: SupportTicket) {
+    const message = supportReplies[ticket.id]?.trim()
+    if (!message) return
+    setSupportReplyBusy(ticket.id)
+    try {
+      const { ticket: updatedTicket } = await authRequest<{ ticket: SupportTicket }>(`/api/support/tickets/${encodeURIComponent(ticket.id)}/replies`, { message })
+      setSupportTickets((current) => current.map((item) => item.id === updatedTicket.id ? updatedTicket : item))
+      setSupportReplies((current) => ({ ...current, [ticket.id]: '' }))
+    } catch (error: unknown) {
+      setNotice(error instanceof Error ? error.message : 'Nie udało się wysłać odpowiedzi.')
+    } finally {
+      setSupportReplyBusy('')
     }
   }
 
@@ -1429,6 +1509,20 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
     setChatMode('room')
     setRoomMinimized(false)
     setChatDraft('')
+    if (chatImageDraft) URL.revokeObjectURL(chatImageDraft.preview)
+    setChatImageDraft(null)
+    setShowChatEmojiPicker(false)
+  }
+
+  async function respondToChatRequest(requestId: string, action: 'accept' | 'decline') {
+    try {
+      const { request } = await authRequest<{ request: { id: string; status: ChatRequest['status'] } }>(`/api/chat/requests/${encodeURIComponent(requestId)}/respond`, { action })
+      setChatRequests((current) => current.map((item) => item.id === request.id ? { ...item, status: request.status } : item))
+      setNotice(action === 'accept' ? 'Zaproszenie zaakceptowane. Możecie już pisać.' : 'Zaproszenie do rozmowy odrzucone.')
+    } catch (error: unknown) {
+      setNotice(error instanceof Error ? error.message : 'Nie udało się odpowiedzieć na zaproszenie.')
+    }
+    window.setTimeout(() => setNotice(''), 2600)
   }
 
   async function markChatNotificationsRead(handle: string) {
@@ -1464,6 +1558,9 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
     setActiveChatHandle('')
     setRoomMinimized(false)
     setChatDraft('')
+    if (chatImageDraft) URL.revokeObjectURL(chatImageDraft.preview)
+    setChatImageDraft(null)
+    setShowChatEmojiPicker(false)
   }
 
   async function sendCrewInvitation(person: Person) {
@@ -1648,13 +1745,69 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
   async function sendRoomMessage(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     const text = chatDraft.trim()
-    if (!text || !activeChat || !crewHandles.includes(activeChat.handle)) return
+    if ((!text && !chatImageDraft) || !activeChat) return
     try {
-      const { message } = await authRequest<{ message: ChatMessage }>('/api/chat', { scope: 'room', with: activeChat.handle, text })
+      if (!hasAcceptedPrivateRoom) {
+        if (chatImageDraft) {
+          setNotice('Najpierw wyślij zaproszenie tekstowe. Zdjęcia można wysyłać po zaakceptowaniu rozmowy.')
+          window.setTimeout(() => setNotice(''), 3200)
+          return
+        }
+        const { request, message } = await authRequest<{ request: { id: string; status: 'pending' }; message: ChatMessage }>('/api/chat/requests', { with: activeChat.handle, text })
+        setChatRequests((current) => [{ id: request.id, status: request.status, direction: 'outgoing', person: activeChat, createdAt: message.createdAt, latestMessage: message }, ...current.filter((item) => item.id !== request.id)])
+        setChatMessages((current) => [...current.filter((item) => item.id !== message.id), message])
+        setChatDraft('')
+        setNotice('Wysłano zaproszenie do prywatnej rozmowy.')
+        window.setTimeout(() => setNotice(''), 2600)
+        return
+      }
+      let uploadedMedia: { id: string } | null = null
+      if (chatImageDraft) {
+        const file = chatImageDraft.file
+        const upload = file.type === 'image/gif' ? file : await (async () => {
+          const resized = await resizeProfileImage(file, 1600)
+          return await (await fetch(resized)).blob()
+        })()
+        uploadedMedia = await uploadMedia(upload)
+      }
+      const { message } = await authRequest<{ message: ChatMessage }>('/api/chat', {
+        scope: 'room',
+        with: activeChat.handle,
+        text,
+        mediaId: uploadedMedia?.id,
+        temporarySeconds: uploadedMedia ? chatImageDraft?.temporarySeconds ?? 0 : 0,
+      })
       setChatMessages((current) => [...current.filter((item) => item.id !== message.id), message])
       setChatDraft('')
+      if (chatImageDraft) URL.revokeObjectURL(chatImageDraft.preview)
+      setChatImageDraft(null)
     } catch (error: unknown) {
       showPostError(error, 'Nie udało się wysłać wiadomości prywatnej.')
+    }
+  }
+
+  function chooseChatImage(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.currentTarget.files?.[0]
+    event.currentTarget.value = ''
+    if (!file) return
+    const maxSize = file.type === 'image/gif' ? 8 * 1024 * 1024 : 12 * 1024 * 1024
+    if (!file.type.startsWith('image/') || file.size > maxSize) {
+      setNotice(file.type === 'image/gif' ? 'GIF może mieć maksymalnie 8 MB.' : 'Wybierz zdjęcie do 12 MB.')
+      window.setTimeout(() => setNotice(''), 2600)
+      return
+    }
+    if (chatImageDraft) URL.revokeObjectURL(chatImageDraft.preview)
+    setChatImageDraft({ file, preview: URL.createObjectURL(file), temporarySeconds: 0 })
+  }
+
+  async function openTemporaryChatPhoto(message: ChatMessage) {
+    if (!message.temporarySeconds || !activeChat || message.author.handle === currentUser.handle || message.expiresAt) return
+    try {
+      const result = await authRequest<{ openedAt: number; expiresAt: number }>(`/api/chat/messages/${encodeURIComponent(String(message.id))}/open`, {})
+      setChatMessages((current) => current.map((item) => item.id === message.id ? { ...item, expiresAt: result.expiresAt } : item))
+      setChatClockNow(Date.now())
+    } catch (error: unknown) {
+      setNotice(error instanceof Error ? error.message : 'Nie udało się otworzyć zdjęcia czasowego.')
     }
   }
 
@@ -2185,6 +2338,7 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
           <span><strong>@{activeChat.nickname ?? activeChat.handle}{activeChat.profileVerified && <BadgeCheck className="verified-profile-badge" size={13} aria-label="Zweryfikowany profil" />}</strong><small>{isMinimized ? 'Przywróć chat' : 'Pokój prywatny'}</small></span>
         </button>
         <div className="chat-room-window-actions">
+          {!isMinimized && <button type="button" onClick={() => openProfile(activeChat)} aria-label="Otwórz profil użytkownika" title="Profil"><UserRound size={16} /></button>}
           {!isMinimized && <button type="button" onClick={() => void toggleChatMute(activeChat.handle)} aria-label={mutedChatHandles.includes(activeChat.handle) ? 'Włącz powiadomienia rozmowy' : 'Wycisz powiadomienia rozmowy'} title={mutedChatHandles.includes(activeChat.handle) ? 'Włącz powiadomienia' : 'Wycisz powiadomienia'}>{mutedChatHandles.includes(activeChat.handle) ? <Bell size={16} /> : <BellOff size={16} />}</button>}
           <button type="button" onClick={isMinimized ? restoreChatRoom : minimizeChatRoom} aria-label={isMinimized ? 'Otwórz chat' : 'Minimalizuj chat'} title={isMinimized ? 'Otwórz chat' : 'Minimalizuj chat'}>{isMinimized ? <Maximize2 size={16} /> : <Minimize2 size={16} />}</button>
           <button type="button" onClick={closeChatRoom} aria-label="Zamknij chat" title="Zamknij chat"><X size={17} /></button>
@@ -2194,11 +2348,47 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
         {activeRoomInvitation?.to.handle === currentUser.handle && <div className="room-invitation-banner">{activeRoomInvitation.from.nickname ?? activeRoomInvitation.from.handle} zaprasza Cię do Ekipy.<button onClick={() => respondToCrewInvitation(activeRoomInvitation.id, true)}>Akceptuj</button><button className="decline-invite" onClick={() => respondToCrewInvitation(activeRoomInvitation.id, false)}>Odrzuć</button></div>}
         {activeRoomInvitation?.from.handle === currentUser.handle && <div className="room-invitation-status">Zaproszenie do Ekipy czeka na odpowiedź.</div>}
         <div className="chat-room-messages" aria-live="polite">
-          {!crewHandles.includes(activeChat.handle) && <div className="chat-intro"><span><LockKeyhole size={19} /></span><strong>Rozmowa prywatna</strong><p>Wiadomości 1:1 będą dostępne po zaakceptowaniu zaproszenia do Ekipy.</p></div>}
-          {roomMessages.map((message) => <article className={`room-message ${message.author.handle === currentUser.handle ? 'from-you' : ''}`} key={message.id}>{message.author.handle !== currentUser.handle && <img src={message.author.avatar} alt="" />}<div><p>{message.text}</p><small>{message.time}</small>{message.author.id && message.author.id !== currentUser.id && <button className="chat-report-button" onClick={() => reportContent('message', `message:${message.id}`, message.author, message.text)} aria-label="Zgłoś wiadomość" title="Zgłoś wiadomość"><Flag size={13} />Zgłoś</button>}</div></article>)}
+          {!hasAcceptedPrivateRoom && <div className="chat-intro"><span><LockKeyhole size={19} /></span><strong>Rozmowa prywatna</strong><p>Wyślij zaproszenie do rozmowy. Druga osoba musi je zaakceptować, zanim będziecie mogli pisać dalej.</p></div>}
+          {roomMessages.map((message) => {
+            const expired = Boolean(message.temporarySeconds && message.expiresAt && message.expiresAt <= chatClockNow)
+            const waitingToOpen = Boolean(message.temporarySeconds && message.author.handle !== currentUser.handle && !message.expiresAt)
+            return <article className={`room-message ${message.author.handle === currentUser.handle ? 'from-you' : ''}`} key={message.id}>
+              {message.author.handle !== currentUser.handle && <img src={message.author.avatar} alt="" />}
+              <div>
+                {message.text && <p>{message.text}</p>}
+                {message.mediaUrl && !expired && (waitingToOpen
+                  ? <button className="chat-temporary-open" type="button" onClick={() => void openTemporaryChatPhoto(message)}><Image size={16} />Otwórz zdjęcie · {message.temporarySeconds}s</button>
+                  : <img className="chat-message-image" src={message.mediaUrl} alt={message.temporarySeconds ? 'Zdjęcie czasowe' : 'Zdjęcie w wiadomości'} />)}
+                {expired && <p className="chat-expired-media">Zdjęcie czasowe wygasło</p>}
+                <small>{message.time}</small>
+                {message.author.id && message.author.id !== currentUser.id && <button className="chat-report-button" onClick={() => reportContent('message', `message:${message.id}`, message.author, message.text)} aria-label="Zgłoś wiadomość" title="Zgłoś wiadomość"><Flag size={13} />Zgłoś</button>}
+              </div>
+            </article>
+          })}
         </div>
-        <div className="room-actions">{crewHandles.includes(activeChat.handle) ? <span className="room-crew-status"><Check size={15} /> Jesteście w Ekipie</span> : activeRoomInvitation ? <span className="room-crew-status">Zaproszenie wysłane</span> : <button onClick={() => void sendCrewInvitation(activeChat)}><UsersRound size={15} /> Zaproś do Ekipy</button>}</div>
-        <form className="chat-composer" onSubmit={sendRoomMessage}><input value={chatDraft} onChange={(event) => setChatDraft(event.target.value)} placeholder={crewHandles.includes(activeChat.handle) ? `Wiadomość do @${activeChat.nickname ?? activeChat.handle}...` : 'Dołączcie do Ekipy, aby rozmawiać prywatnie'} aria-label="Wiadomość prywatna" disabled={!crewHandles.includes(activeChat.handle)} /><button type="submit" disabled={!chatDraft.trim() || !crewHandles.includes(activeChat.handle)} aria-label="Wyślij wiadomość"><Send size={17} /></button></form>
+        <div className="room-actions">
+          {hasAcceptedPrivateRoom ? <span className="room-crew-status"><Check size={15} /> Prywatna rozmowa</span>
+            : activeChatRequest?.direction === 'incoming' ? <><span className="room-crew-status">Zaproszenie do rozmowy</span><button onClick={() => void respondToChatRequest(activeChatRequest.id, 'accept')}>Akceptuj</button><button className="decline-invite" onClick={() => void respondToChatRequest(activeChatRequest.id, 'decline')}>Odrzuć</button></>
+              : activeChatRequest ? <span className="room-crew-status">Zaproszenie wysłane · oczekuje na akceptację</span>
+                : null}
+          {!crewHandles.includes(activeChat.handle) && !activeRoomInvitation && <button onClick={() => void sendCrewInvitation(activeChat)}><UsersRound size={15} /> Zaproś do Ekipy</button>}
+          {crewHandles.includes(activeChat.handle) && <span className="room-crew-status">Jesteście w Ekipie</span>}
+          <button onClick={() => reportProfile(activeChat)}><Flag size={14} /> Zgłoś profil</button>
+          <button onClick={() => void toggleUserBlock(activeChat)}><Ban size={14} /> Zablokuj</button>
+        </div>
+        {hasAcceptedPrivateRoom && chatImageDraft && <div className="chat-image-draft">
+          <img src={chatImageDraft.preview} alt="Podgląd zdjęcia do wysłania" />
+          <label>Czas wyświetlania <select value={chatImageDraft.temporarySeconds} onChange={(event) => setChatImageDraft((current) => current ? { ...current, temporarySeconds: Number(event.target.value) } : current)}><option value={0}>Bez limitu</option><option value={5}>5 sekund</option><option value={10}>10 sekund</option><option value={15}>15 sekund</option></select></label>
+          <button type="button" aria-label="Usuń wybrane zdjęcie" onClick={() => { URL.revokeObjectURL(chatImageDraft.preview); setChatImageDraft(null) }}><X size={15} /></button>
+        </div>}
+        {showChatEmojiPicker && <div className="chat-emoji-picker" aria-label="Wybierz emoji">{['😀', '😂', '🥰', '😍', '😉', '😊', '👍', '❤️', '🎉', '🤔', '🙌', '😎'].map((emoji) => <button type="button" key={emoji} onClick={() => setChatDraft((current) => `${current}${emoji}`)}>{emoji}</button>)}</div>}
+        <form className="chat-composer" onSubmit={sendRoomMessage}>
+          <input ref={chatImageInput} type="file" accept="image/*" hidden onChange={chooseChatImage} />
+          <button type="button" disabled={!hasAcceptedPrivateRoom} onClick={() => chatImageInput.current?.click()} aria-label="Dodaj zdjęcie lub GIF" title="Dodaj zdjęcie lub GIF"><Image size={16} /></button>
+          <button type="button" disabled={!hasAcceptedPrivateRoom} onClick={() => setShowChatEmojiPicker((current) => !current)} aria-label="Wybierz emoji" title="Emoji">😊</button>
+          <input value={chatDraft} onChange={(event) => setChatDraft(event.target.value)} placeholder={hasAcceptedPrivateRoom ? `Wiadomość do @${activeChat.nickname ?? activeChat.handle}...` : 'Najpierw wyślij lub zaakceptuj zaproszenie do rozmowy'} aria-label="Wiadomość prywatna" disabled={!hasAcceptedPrivateRoom && Boolean(activeChatRequest)} />
+          <button type="submit" disabled={(!chatDraft.trim() && !chatImageDraft) || Boolean(activeChatRequest && activeChatRequest.direction === 'outgoing')} aria-label={hasAcceptedPrivateRoom ? 'Wyślij wiadomość' : 'Wyślij zaproszenie do rozmowy'}><Send size={17} /></button>
+        </form>
       </>}
     </section>
   }
@@ -2315,7 +2505,7 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
           </div>}
           {view === 'home' && homeTab === 'board' && <div className="feed-mode-tabs" role="tablist" aria-label="Zakres tablicy">
             <button className={feedMode === 'for-you' ? 'active' : ''} role="tab" aria-selected={feedMode === 'for-you'} onClick={() => setFeedMode('for-you')}>Dla Ciebie</button>
-            <button className={feedMode === 'following' ? 'active' : ''} role="tab" aria-selected={feedMode === 'following'} onClick={() => setFeedMode('following')}>Obserwowane <span>{followedTopics.length}</span></button>
+            <button className={feedMode === 'following' ? 'active' : ''} role="tab" aria-selected={feedMode === 'following'} onClick={() => setFeedMode('following')}>Obserwowane tematy <span>{followedTopics.length}</span></button>
           </div>}
 
           {view === 'home' && homeTab === 'board' && (
@@ -2368,14 +2558,31 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
 
           {view === 'home' && homeTab === 'chat' && <section className="chat-stage">
             {chatMode === 'public' ? <>
-              <header className="chat-stage-heading"><div><span className="chat-kicker">ROZMOWA DLA WSZYSTKICH</span><h2>Czat YouTopic</h2><p>Napisz na forum albo wybierz osobę, żeby przejść do prywatnego Pokoju.</p></div><span className="chat-users-count"><UsersRound size={15} />{allUsers.length} osób</span></header>
-              {unreadChatCounts.size > 0 && <section className="chat-unread-inbox" aria-label="Nieprzeczytane wiadomości">
-                <strong>PRYWATNE WIADOMOŚCI</strong>
-                <div>{[...unreadChatCounts].map(([handle, count]) => {
+              <header className="chat-stage-heading"><div><span className="chat-kicker">POZNAWAJ I ROZMAWIAJ</span><h2>Czat YouTopic</h2><p>Wybierz osobę, poznaj jej profil i wyślij zaproszenie do prywatnego Pokoju.</p></div>
+                <div className="chat-header-tools">
+                  <label className="chat-people-search"><Search size={15} /><input value={chatPeopleSearch} onChange={(event) => setChatPeopleSearch(event.target.value)} placeholder="Szukaj osób..." aria-label="Szukaj osób do rozmowy" /></label>
+                  <span className="chat-users-count"><UsersRound size={15} />{platformUsers.length} osób</span>
+                  {chatPeopleSearch.trim() && <div className="chat-people-results">
+                    {discoverableChatPeople.map((person) => <div className="chat-person-result" key={person.handle}>
+                      <button className="chat-person-result-profile" type="button" onClick={() => openProfile(person)}><img src={person.avatar} alt="" /><span><strong>{person.name}</strong><small>@{person.nickname ?? person.handle}</small></span></button>
+                      <button type="button" aria-label={`Otwórz rozmowę z ${person.name}`} title="Otwórz prywatny pokój" onClick={() => openChatRoom(person)}><MessageCircle size={15} /></button>
+                    </div>)}
+                    {discoverableChatPeople.length === 0 && <p className="search-results-empty">Nie znaleziono osób.</p>}
+                  </div>}
+                </div>
+              </header>
+              {(unreadChatCounts.size > 0 || incomingChatRequests.length > 0) && <section className="chat-unread-inbox" aria-label="Zaproszenia i nieprzeczytane wiadomości">
+                {incomingChatRequests.length > 0 && <div className="chat-request-list"><strong>ZAPROSZENIA DO PRYWATNEJ ROZMOWY</strong>{incomingChatRequests.map((request) => <article className="chat-request-item" key={request.id}>
+                  <img src={request.person.avatar} alt="" />
+                  <p><strong>@{request.person.nickname ?? request.person.handle}</strong><span>{request.latestMessage?.text || 'Zaprasza Cię do prywatnej rozmowy.'}</span></p>
+                  <button type="button" onClick={() => { void respondToChatRequest(request.id, 'accept'); openChatRoom(request.person) }}>Akceptuj</button>
+                  <button className="decline-invite" type="button" onClick={() => void respondToChatRequest(request.id, 'decline')}>Odrzuć</button>
+                </article>)}</div>}
+                {unreadChatCounts.size > 0 && <div className="chat-unread-list"><strong>PRYWATNE WIADOMOŚCI</strong><div>{[...unreadChatCounts].map(([handle, count]) => {
                   const person = allUsers.find((candidate) => candidate.handle === handle)
                   if (!person) return null
                   return <button className="chat-unread-contact" key={handle} onClick={() => openChatRoom(person)}><img src={person.avatar} alt="" /><span>@{person.nickname ?? person.handle}</span><b>{count}</b></button>
-                })}</div>
+                })}</div></div>}
               </section>}
               <div className="chat-public-messages" aria-live="polite">
                 {publicChatMessages.map((message) => <article className={`public-chat-message ${message.author.handle === currentUser.handle ? 'from-you' : ''}`} key={message.id}>
@@ -2503,7 +2710,8 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
             {socialNotifications.map((notification) => {
               const Icon = notification.type === 'like' || notification.type === 'comment_like' ? Heart
                 : notification.type === 'boost' ? ArrowUp
-                  : notification.type === 'chat_message' ? MessageCircle
+                  : notification.type === 'support_reply' ? LifeBuoy
+                  : ['chat_message', 'chat_request', 'chat_request_accepted'].includes(notification.type) ? MessageCircle
                     : UsersRound
               const invitation = notification.type === 'crew_invitation'
                 ? incomingCrewInvitations.find((item) => item.id === notification.crewInvitationId
@@ -2518,7 +2726,11 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
               return <div className={`notification-row ${notification.readAt ? '' : 'is-unread'} ${invitation ? 'has-notification-actions' : ''}`} key={notification.id}>
                 <img src={notification.actor?.avatar ?? '/youtopic-mark.svg'} alt="" />
                 <button className="notification-main" type="button" onClick={() => {
-                  if (notification.type === 'chat_message' && notification.chatHandle) {
+                  if (notification.type === 'support_reply' && notification.ticketId) {
+                    setSupportFocusTicketId(notification.ticketId)
+                    pushNavigation({ view: 'support', homeTab: 'board', chatMode: 'public', activeChatHandle: '' })
+                    setView('support')
+                  } else if (['chat_message', 'chat_request', 'chat_request_accepted'].includes(notification.type) && notification.chatHandle) {
                     const person = allUsers.find((candidate) => candidate.handle === notification.chatHandle)
                       ?? (notification.actor?.handle === notification.chatHandle ? notification.actor : undefined)
                     if (!person) {
@@ -2542,7 +2754,7 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
                   }
                   markRead()
                 }}>
-                  <p><strong>{notification.actor?.nickname ?? notification.actor?.handle ?? 'Użytkownik'}</strong> {notification.message}<small>{new Intl.DateTimeFormat('pl-PL', { dateStyle: 'medium', timeStyle: 'short' }).format(notification.createdAt)}</small></p>
+                  <p><strong>{notification.type === 'support_reply' ? 'Zespół YouTopic' : notification.actor?.nickname ?? notification.actor?.handle ?? 'Użytkownik'}</strong> {notification.message}<small>{new Intl.DateTimeFormat('pl-PL', { dateStyle: 'medium', timeStyle: 'short' }).format(notification.createdAt)}</small></p>
                 </button>
                 {invitation
                   ? <div className="notification-actions"><button type="button" onClick={() => { void respondToCrewInvitation(invitation.id, true).then((success) => { if (success) markRead() }) }}>Akceptuj</button><button type="button" className="decline-invite" onClick={() => { void respondToCrewInvitation(invitation.id, false).then((success) => { if (success) markRead() }) }}>Odrzuć</button></div>
@@ -2554,7 +2766,7 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
           </section>}
 
           {view === 'support' && <section className="support-panel">
-            <div className="support-intro"><span><LifeBuoy size={22} /></span><div><strong>W czym możemy pomóc?</strong><p>Opisz problem lub pomysł. Odpowiedź zespołu znajdziesz tutaj.</p></div></div>
+            <div className="support-intro"><span><LifeBuoy size={22} /></span><div><strong>W czym możemy pomóc?</strong><p>Opisz nową sprawę albo kontynuuj rozmowę w istniejącym zgłoszeniu. Odpowiedź zespołu znajdziesz tutaj.</p></div></div>
             <form className="support-request-form" onSubmit={submitSupportTicket}>
               <label>Temat sprawy<input value={supportSubject} onChange={(event) => setSupportSubject(event.target.value)} maxLength={120} required placeholder="Krótko opisz sprawę" /></label>
               <label>Kategoria<select value={supportCategory} onChange={(event) => setSupportCategory(event.target.value as SupportTicket['category'])}><option value="account">Konto</option><option value="technical">Problem techniczny</option><option value="security">Bezpieczeństwo</option><option value="idea">Pomysł lub sugestia</option><option value="other">Inne</option></select></label>
@@ -2567,10 +2779,17 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
                 .catch((error: unknown) => setNotice(error instanceof Error ? error.message : 'Nie udało się odświeżyć spraw.'))
             }}>Odśwież</button></div>
             {supportTickets.length === 0 && <p className="support-empty">Nie masz jeszcze wysłanych spraw.</p>}
-            <div className="support-own-tickets">{supportTickets.map((ticket) => <article className="support-own-ticket" key={ticket.id}>
-              <header><strong>{ticket.subject}</strong><span className={`ticket-status status-${ticket.status}`}>{ticket.status === 'resolved' ? 'Rozwiązana' : ticket.status === 'in_progress' ? 'W trakcie' : 'Otwarta'}</span></header>
+            <div className="support-own-tickets">{supportTickets.map((ticket) => <article className={`support-own-ticket ${supportFocusTicketId === ticket.id ? 'notification-target' : ''}`} id={`support-ticket-${ticket.id}`} key={ticket.id}>
+              <header><strong>{ticket.subject}</strong><span className={`ticket-status status-${ticket.status}`}>{ticket.status === 'resolved' ? 'Rozwiązana' : ticket.status === 'closed' ? 'Zamknięta' : ticket.status === 'in_progress' ? 'W trakcie' : 'Otwarta'}</span></header>
               <small>{new Intl.DateTimeFormat('pl-PL', { dateStyle: 'medium', timeStyle: 'short' }).format(ticket.updatedAt)}</small>
               {ticket.messages.map((item) => <div className={`support-own-message ${item.authorType}`} key={item.id}><strong>{item.authorType === 'admin' ? `Zespół YouTopic · ${item.authorName}` : 'Ty'}</strong><p>{item.message}</p></div>)}
+              {ticket.status === 'resolved' || ticket.status === 'closed'
+                ? <p className="support-ticket-closed-note">Ta sprawa jest {ticket.status === 'resolved' ? 'rozwiązana' : 'zamknięta'}. Jeśli potrzebujesz dalszej pomocy, wyślij nowe zgłoszenie powyżej.</p>
+                : <form className="support-ticket-reply" onSubmit={(event) => { event.preventDefault(); void replyToSupportTicket(ticket) }}>
+                  <label htmlFor={`support-reply-${ticket.id}`}>Twoja odpowiedź</label>
+                  <textarea id={`support-reply-${ticket.id}`} value={supportReplies[ticket.id] ?? ''} onChange={(event) => setSupportReplies((current) => ({ ...current, [ticket.id]: event.target.value }))} maxLength={5000} rows={3} required placeholder="Napisz wiadomość w tej sprawie..." />
+                  <button className="publish-button" type="submit" disabled={supportReplyBusy === ticket.id || !supportReplies[ticket.id]?.trim()}>{supportReplyBusy === ticket.id ? 'Wysyłanie…' : 'Odpowiedz'} <Send size={15} /></button>
+                </form>}
             </article>)}</div>
           </section>}
 
@@ -3008,7 +3227,7 @@ function AuthScreen({ onAuthenticated }: { onAuthenticated: (user: Person) => vo
         </aside>
         <p className="auth-kicker">{mode === 'register' ? 'MIŁO, ŻE DOŁĄCZASZ' : mode === 'verify-email' ? 'POTWIERDŹ SWÓJ ADRES' : mode === 'forgot-password' || mode === 'reset-password' ? 'ODZYSKIWANIE KONTA' : 'WRÓĆ DO SWOJEJ EKIPY'}</p>
         <h2>{mode === 'register' ? 'Utwórz konto' : mode === 'verify-email' ? 'Sprawdź pocztę' : mode === 'forgot-password' ? 'Nie pamiętam hasła' : mode === 'reset-password' ? 'Ustaw nowe hasło' : 'Zaloguj się'}</h2>
-        <p className="auth-subtitle">{mode === 'register' ? 'Podaj swoje dane, aby dołączyć do YouTopic.' : mode === 'verify-email' ? `Wysłaliśmy link potwierdzający na ${pendingEmail || email || 'Twój adres e-mail'}. Otwórz go, aby aktywować konto.` : mode === 'forgot-password' ? 'Podaj e-mail przypisany do konta i wybierz, gdzie wysłać kod do zmiany hasła.' : mode === 'reset-password' ? resetToken ? 'Ustaw nowe hasło za pomocą wcześniej wysłanego linku.' : `Wpisz kod wysłany na ${resetDestination || 'wybrany kanał'} i ustaw nowe hasło. Kod jest ważny przez 10 minut.` : 'Zaloguj się przy użyciu adresu e-mail i hasła.'}</p>
+        <p className="auth-subtitle">{mode === 'register' ? 'Podaj swoje dane, aby dołączyć do YouTopic.' : mode === 'verify-email' ? `Link potwierdzający wysyłamy na ${pendingEmail || email || 'Twój adres e-mail'}. Otwórz go, aby aktywować konto. Jeśli nie dotrze, użyj opcji wysłania go ponownie.` : mode === 'forgot-password' ? 'Podaj e-mail przypisany do konta i wybierz, gdzie wysłać kod do zmiany hasła.' : mode === 'reset-password' ? resetToken ? 'Ustaw nowe hasło za pomocą wcześniej wysłanego linku.' : `Wpisz kod wysłany na ${resetDestination || 'wybrany kanał'} i ustaw nowe hasło. Kod jest ważny przez 10 minut.` : 'Zaloguj się przy użyciu adresu e-mail i hasła.'}</p>
         {message && <p className="auth-success" role="status">{message}</p>}
         {error && <p className="auth-error" role="alert">{error}</p>}
 

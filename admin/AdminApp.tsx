@@ -29,7 +29,7 @@ import {
   UsersRound,
 } from 'lucide-react'
 
-type Section = 'overview' | 'analytics' | 'users' | 'reports' | 'support' | 'content' | 'health' | 'audit' | 'settings' | 'announcements' | 'admins'
+type Section = 'overview' | 'analytics' | 'users' | 'reports' | 'support' | 'content' | 'chats' | 'health' | 'audit' | 'settings' | 'announcements' | 'admins'
 type Permission = AdminPermission
 const permissionOptions = adminPermissionCatalog.filter((permission) => permission.id !== 'admins.manage')
 
@@ -80,7 +80,11 @@ type SupportTicket = {
   id: string
   subject: string
   category: 'account' | 'technical' | 'security' | 'idea' | 'other'
-  status: 'open' | 'in_progress' | 'resolved'
+  status: 'open' | 'in_progress' | 'resolved' | 'closed'
+  priority: 'low' | 'normal' | 'high' | 'urgent'
+  assigneeId: string | null
+  assignee: { id: string; name: string; rank: string } | null
+  internalNotes: Array<{ id: string; adminId: string; adminName: string; note: string; createdAt: number }>
   messages: Array<{ id: string; authorType: 'user' | 'admin'; authorName: string; message: string; createdAt: number }>
   user: { id: string; name: string; nickname: string }
   createdAt: number
@@ -94,6 +98,7 @@ type AuditEntry = {
   rank: string
   method: string
   path: string
+  details?: string
   statusCode: number
   createdAt: number
 }
@@ -107,6 +112,35 @@ type ModeratedContent = {
   contentPreview: string
   contentUrl: string
   authorName: string
+  moderationReason?: string
+}
+
+type ManageableContent = {
+  key: string
+  targetType: 'post' | 'comment'
+  targetId: string
+  targetUserId: string
+  authorName: string
+  contentPreview: string
+  createdAt: number
+  isModerated: boolean
+  moderationRecordId?: string
+  moderationReason?: string
+  reportCount: number
+}
+
+type AdminChatMessage = {
+  id: string
+  author: { id: string; name: string; nickname: string; avatar: string }
+  recipient: { id: string; name: string; nickname: string; avatar: string }
+  text: string
+  createdAt: number
+  mediaUrl?: string
+  mediaType?: string
+  temporarySeconds?: number
+  expiresAt?: number
+  isModerated: boolean
+  hasPendingReport: boolean
 }
 
 type AdminUser = {
@@ -175,6 +209,10 @@ type ModerationReport = {
   reason: string
   createdAt: number
   status: 'pending' | 'resolved'
+  priority: 'low' | 'normal' | 'high' | 'urgent'
+  assigneeId: string | null
+  assignee: { id: string; name: string; rank: string } | null
+  internalNotes: Array<{ id: string; adminName: string; note: string; createdAt: number }>
   decision: 'dismiss' | 'remove_content' | 'warn' | 'block_account' | null
   decisionNote: string
   decidedAt: number | null
@@ -327,10 +365,20 @@ function AdminApp() {
   const [health, setHealth] = useState<Health | null>(null)
   const [auditEntries, setAuditEntries] = useState<AuditEntry[]>([])
   const [supportTickets, setSupportTickets] = useState<SupportTicket[]>([])
+  const [supportAssignees, setSupportAssignees] = useState<Array<{ id: string; name: string; rank: string }>>([])
+  const [reportAssignees, setReportAssignees] = useState<Array<{ id: string; name: string; rank: string }>>([])
   const [supportReply, setSupportReply] = useState('')
+  const [supportInternalNote, setSupportInternalNote] = useState('')
+  const [reportInternalNotes, setReportInternalNotes] = useState<Record<string, string>>({})
   const [activeSupportTicketId, setActiveSupportTicketId] = useState('')
-  const [moderatedContent, setModeratedContent] = useState<ModeratedContent[]>([])
+  const [manageableContent, setManageableContent] = useState<ManageableContent[]>([])
+  const [contentSearch, setContentSearch] = useState('')
+  const [contentTypeFilter, setContentTypeFilter] = useState<'all' | 'post' | 'comment'>('all')
+  const [contentStatusFilter, setContentStatusFilter] = useState<'all' | 'visible' | 'hidden'>('all')
+  const [adminChatMessages, setAdminChatMessages] = useState<AdminChatMessage[]>([])
   const [registrationEnabled, setRegistrationEnabled] = useState(true)
+  const [publishingEnabled, setPublishingEnabled] = useState(true)
+  const [auditSearch, setAuditSearch] = useState('')
   const [users, setUsers] = useState<AdminUser[]>([])
   const [reports, setReports] = useState<ModerationReport[]>([])
   const [reportStatusFilter, setReportStatusFilter] = useState<'pending' | 'resolved' | 'all'>('pending')
@@ -374,7 +422,9 @@ function AdminApp() {
   const [success, setSuccess] = useState('')
 
   function can(permission: Permission, admin = currentAdmin) {
-    return Boolean(admin?.isSuperAdmin || admin?.permissions.includes(permission))
+    return Boolean(admin?.isSuperAdmin
+      || admin?.permissions.includes(permission)
+      || (permission === 'reports.view' && admin?.permissions.includes('reports.manage')))
   }
 
   function firstAvailableSection(admin: AdminSession): Section {
@@ -382,6 +432,7 @@ function AdminApp() {
     if (admin.permissions.includes('analytics.view')) return 'analytics'
     if (admin.permissions.includes('users.view')) return 'users'
     if (admin.permissions.includes('reports.view')) return 'reports'
+    if (admin.permissions.includes('chat.messages.view')) return 'chats'
     if (admin.permissions.includes('support.view')) return 'support'
     if (admin.permissions.includes('content.view')) return 'content'
     if (admin.permissions.includes('health.view')) return 'health'
@@ -407,19 +458,28 @@ function AdminApp() {
       requests.push(apiRequest<{ entries: AuditEntry[] }>('/api/admin/audit').then((result) => setAuditEntries(result.entries)))
     }
     if (can('support.view', admin)) {
-      requests.push(apiRequest<{ tickets: SupportTicket[] }>('/api/admin/support/tickets').then((result) => setSupportTickets(result.tickets)))
+      requests.push(apiRequest<{ tickets: SupportTicket[]; supportAssignees: typeof supportAssignees }>('/api/admin/support/tickets').then((result) => {
+        setSupportTickets(result.tickets)
+        setSupportAssignees(result.supportAssignees)
+      }))
     }
     if (can('content.view', admin)) {
-      requests.push(apiRequest<{ items: ModeratedContent[] }>('/api/admin/content/moderated').then((result) => setModeratedContent(result.items)))
+      requests.push(apiRequest<{ items: ManageableContent[] }>('/api/admin/content').then((result) => setManageableContent(result.items)))
     }
     if (can('settings.view', admin)) {
-      requests.push(apiRequest<{ settings: { registrationEnabled: boolean } }>('/api/admin/settings').then((result) => setRegistrationEnabled(result.settings.registrationEnabled)))
+      requests.push(apiRequest<{ settings: { registrationEnabled: boolean; publishingEnabled: boolean } }>('/api/admin/settings').then((result) => {
+        setRegistrationEnabled(result.settings.registrationEnabled)
+        setPublishingEnabled(result.settings.publishingEnabled)
+      }))
     }
     if (can('users.view', admin)) {
       requests.push(apiRequest<{ users: AdminUser[] }>('/api/admin/users').then((result) => setUsers(result.users)))
     }
     if (can('reports.view', admin)) {
-      requests.push(apiRequest<{ reports: ModerationReport[] }>('/api/admin/reports').then((result) => setReports(result.reports)))
+      requests.push(apiRequest<{ reports: ModerationReport[]; reportAssignees: typeof supportAssignees }>('/api/admin/reports').then((result) => {
+        setReports(result.reports)
+        setReportAssignees(result.reportAssignees)
+      }))
     }
     if (can('announcements.view', admin)) {
       requests.push(apiRequest<{ announcements: Announcement[] }>('/api/admin/announcements').then((result) => setAnnouncements(result.announcements)))
@@ -431,6 +491,16 @@ function AdminApp() {
       }))
     }
     await Promise.all(requests)
+  }
+
+  async function refreshAdminChats() {
+    try {
+      const result = await apiRequest<{ messages: AdminChatMessage[] }>('/api/admin/chats')
+      setAdminChatMessages(result.messages)
+      setError('')
+    } catch (loadError) {
+      setError(loadError instanceof Error ? loadError.message : 'Nie udało się pobrać prywatnych wiadomości.')
+    }
   }
 
   useEffect(() => {
@@ -456,6 +526,11 @@ function AdminApp() {
     if (savedPermissions?.length) setAdminPermissions(savedPermissions)
   }, [adminRank, customRank, editingAdminId, rankPermissionTemplates])
 
+  useEffect(() => {
+    if (!authenticated || section !== 'chats' || !can('chat.messages.view')) return
+    void refreshAdminChats()
+  }, [authenticated, section, currentAdmin])
+
   const visibleUsers = useMemo(() => {
     const query = search.trim().toLocaleLowerCase('pl')
     const activeFilters = (Object.keys(userFilters) as UserFilterKey[]).filter((key) => Boolean(userFilters[key]))
@@ -480,6 +555,69 @@ function AdminApp() {
         && report.createdAt <= toTime
     })
   }, [reportCategoryFilter, reportFromDate, reportSearch, reportStatusFilter, reportToDate, reportTypeFilter, reports])
+
+  const visibleContent = useMemo(() => {
+    const query = contentSearch.trim().toLocaleLowerCase('pl')
+    return manageableContent.filter((item) =>
+      (contentTypeFilter === 'all' || item.targetType === contentTypeFilter)
+      && (contentStatusFilter === 'all' || (contentStatusFilter === 'hidden' ? item.isModerated : !item.isModerated))
+      && (!query || `${item.authorName} ${item.contentPreview} ${item.targetId}`.toLocaleLowerCase('pl').includes(query)))
+  }, [contentSearch, contentStatusFilter, contentTypeFilter, manageableContent])
+
+  const visibleAuditEntries = useMemo(() => {
+    const query = auditSearch.trim().toLocaleLowerCase('pl')
+    return auditEntries.filter((entry) => !query || `${entry.adminName} ${entry.rank} ${entry.method} ${entry.path} ${entry.details ?? ''}`.toLocaleLowerCase('pl').includes(query))
+  }, [auditEntries, auditSearch])
+
+  function exportAuditCsv() {
+    const escapeCsv = (value: string | number) => `"${String(value).replaceAll('"', '""')}"`
+    const rows = [
+      ['Data', 'Administrator', 'Ranga', 'Metoda', 'Ścieżka', 'Szczegóły', 'Kod HTTP'],
+      ...visibleAuditEntries.map((entry) => [
+        formatDate(entry.createdAt),
+        entry.adminName,
+        entry.rank,
+        entry.method,
+        entry.path,
+        entry.details ?? '',
+        entry.statusCode,
+      ]),
+    ]
+    const csv = `\uFEFF${rows.map((row) => row.map(escapeCsv).join(';')).join('\r\n')}`
+    const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }))
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `youtopic-dziennik-administratora-${new Date().toISOString().slice(0, 10)}.csv`
+    link.click()
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000)
+  }
+
+  function exportAnalyticsCsv() {
+    if (!analytics) return
+    const escapeCsv = (value: string | number) => `"${String(value).replaceAll('"', '""')}"`
+    const rows: Array<Array<string | number>> = [
+      ['Wskaźnik', 'Wartość'],
+      ['Konta łącznie', analytics.totalUsers],
+      ['Aktywne konta', analytics.activeUsers],
+      ['Potwierdzone e-maile', analytics.verifiedUsers],
+      ['Niepotwierdzone e-maile', analytics.unverifiedUsers],
+      ['Rejestracje · 30 dni', analytics.registrationCount30Days],
+      ['Zablokowane konta', analytics.blockedUsers],
+      ['Oczekujące zgłoszenia', analytics.reportsPending],
+      ['Rozpatrzone zgłoszenia', analytics.reportsResolved],
+      ['Otwarte sprawy pomocy', analytics.openSupportTickets],
+      [],
+      ['Data', 'Nowe konta'],
+      ...analytics.registrationsByDay.map((day) => [day.date, day.registrations]),
+    ]
+    const csv = `\uFEFF${rows.map((row) => row.map(escapeCsv).join(';')).join('\r\n')}`
+    const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }))
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `youtopic-statystyki-${new Date().toISOString().slice(0, 10)}.csv`
+    link.click()
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000)
+  }
 
   function updateUserFilter(key: UserFilterKey, value: string) {
     setUserFilters((filters) => {
@@ -823,12 +961,13 @@ function AdminApp() {
     }
   }
 
-  async function updateSupportTicket(ticket: SupportTicket, update: { status?: SupportTicket['status']; reply?: string }) {
+  async function updateSupportTicket(ticket: SupportTicket, update: { status?: SupportTicket['status']; reply?: string; priority?: SupportTicket['priority']; assigneeId?: string; internalNote?: string }) {
     setError('')
     setSuccess('')
     try {
       await apiRequest(`/api/admin/support/tickets/${encodeURIComponent(ticket.id)}`, { method: 'PATCH', body: JSON.stringify(update) })
       setSupportReply('')
+      setSupportInternalNote('')
       await loadPanel()
       setActiveSupportTicketId(ticket.id)
       setSuccess('Sprawa pomocy została zaktualizowana.')
@@ -837,12 +976,31 @@ function AdminApp() {
     }
   }
 
+  async function updateReportTriage(report: ModerationReport, update: { priority?: ModerationReport['priority']; assigneeId?: string; internalNote?: string }) {
+    setError('')
+    setSuccess('')
+    try {
+      await apiRequest(`/api/admin/reports/${encodeURIComponent(report.id)}/triage`, { method: 'PATCH', body: JSON.stringify(update) })
+      if (update.internalNote !== undefined) {
+        setReportInternalNotes((notes) => {
+          const next = { ...notes }
+          delete next[report.id]
+          return next
+        })
+      }
+      await loadPanel()
+      setSuccess('Organizacja zgłoszenia została zaktualizowana.')
+    } catch (actionError) {
+      setError(actionError instanceof Error ? actionError.message : 'Nie udało się zaktualizować zgłoszenia.')
+    }
+  }
+
   async function savePlatformSettings(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     setError('')
     setSuccess('')
     try {
-      await apiRequest('/api/admin/settings', { method: 'PATCH', body: JSON.stringify({ registrationEnabled }) })
+      await apiRequest('/api/admin/settings', { method: 'PATCH', body: JSON.stringify({ registrationEnabled, publishingEnabled }) })
       setSuccess('Ustawienia platformy zostały zapisane.')
       await loadPanel()
     } catch (actionError) {
@@ -850,7 +1008,38 @@ function AdminApp() {
     }
   }
 
-  async function restoreModeratedContent(item: ModeratedContent) {
+  async function moderateContent(item: ManageableContent) {
+    if (!can('content.manage')) return
+    const reason = window.prompt(`Uzasadnienie ukrycia ${item.targetType === 'post' ? 'posta' : 'komentarza'} (5–500 znaków):`)
+    if (reason === null) return
+    setError('')
+    setSuccess('')
+    try {
+      await apiRequest('/api/admin/content/moderate', {
+        method: 'POST',
+        body: JSON.stringify({ targetType: item.targetType, targetId: item.targetId, targetUserId: item.targetUserId, reason }),
+      })
+      await loadPanel()
+      setSuccess('Treść została ukryta. Można ją przywrócić z tego panelu.')
+    } catch (actionError) {
+      setError(actionError instanceof Error ? actionError.message : 'Nie udało się ukryć treści.')
+    }
+  }
+
+  async function revokeUserSessions(user: AdminUser) {
+    const reason = window.prompt(`Podaj powód wylogowania wszystkich sesji użytkownika ${user.name} (min. 5 znaków):`)
+    if (reason === null) return
+    setError('')
+    setSuccess('')
+    try {
+      await apiRequest(`/api/admin/users/${encodeURIComponent(user.id)}/revoke-sessions`, { method: 'POST', body: JSON.stringify({ reason }) })
+      setSuccess(`Sesje użytkownika ${user.name} zostały unieważnione.`)
+    } catch (actionError) {
+      setError(actionError instanceof Error ? actionError.message : 'Nie udało się unieważnić sesji użytkownika.')
+    }
+  }
+
+  async function restoreModeratedContent(item: Pick<ModeratedContent, 'reportId'>) {
     if (!window.confirm('Przywrócić wpis moderacji? Element może znów być widoczny u użytkowników.')) return
     setError('')
     setSuccess('')
@@ -860,6 +1049,19 @@ function AdminApp() {
       setSuccess('Wpis moderacji został usunięty.')
     } catch (actionError) {
       setError(actionError instanceof Error ? actionError.message : 'Nie udało się przywrócić treści.')
+    }
+  }
+
+  async function moderateChatMessage(message: AdminChatMessage) {
+    if (!can('chat.messages.moderate') || !window.confirm('Ukryć tę wiadomość i powiązane zdjęcie w rozmowie?')) return
+    setError('')
+    setSuccess('')
+    try {
+      await apiRequest(`/api/admin/chats/${encodeURIComponent(message.id)}`, { method: 'DELETE' })
+      setAdminChatMessages((current) => current.map((item) => item.id === message.id ? { ...item, isModerated: true } : item))
+      setSuccess('Wiadomość została ukryta w rozmowie.')
+    } catch (actionError) {
+      setError(actionError instanceof Error ? actionError.message : 'Nie udało się ukryć wiadomości.')
     }
   }
 
@@ -875,6 +1077,7 @@ function AdminApp() {
         : section === 'reports' ? 'Zgłoszenia'
           : section === 'support' ? 'Centrum pomocy'
             : section === 'content' ? 'Treści'
+              : section === 'chats' ? 'Prywatne rozmowy'
               : section === 'health' ? 'Stan platformy'
                 : section === 'audit' ? 'Dziennik działań'
                   : section === 'settings' ? 'Ustawienia'
@@ -921,7 +1124,8 @@ function AdminApp() {
           {can('analytics.view') && <button className={section === 'analytics' ? 'selected' : ''} onClick={() => setSection('analytics')}><BarChart3 size={18} />Statystyki</button>}
           {can('users.view') && <button className={section === 'users' ? 'selected' : ''} onClick={() => setSection('users')}><UsersRound size={18} />Użytkownicy</button>}
           {can('reports.view') && <button className={section === 'reports' ? 'selected' : ''} onClick={() => setSection('reports')}><Inbox size={18} />Zgłoszenia{reports.filter((report) => report.status === 'pending').length > 0 && <span className="sidebar-report-count">{reports.filter((report) => report.status === 'pending').length}</span>}</button>}
-          {can('support.view') && <button className={section === 'support' ? 'selected' : ''} onClick={() => setSection('support')}><LifeBuoy size={18} />Pomoc{supportTickets.filter((ticket) => ticket.status !== 'resolved').length > 0 && <span className="sidebar-report-count">{supportTickets.filter((ticket) => ticket.status !== 'resolved').length}</span>}</button>}
+          {can('chat.messages.view') && <button className={section === 'chats' ? 'selected' : ''} onClick={() => setSection('chats')}><MessageCircle size={18} />Prywatne rozmowy</button>}
+          {can('support.view') && <button className={section === 'support' ? 'selected' : ''} onClick={() => setSection('support')}><LifeBuoy size={18} />Pomoc{supportTickets.filter((ticket) => ticket.status !== 'resolved' && ticket.status !== 'closed').length > 0 && <span className="sidebar-report-count">{supportTickets.filter((ticket) => ticket.status !== 'resolved' && ticket.status !== 'closed').length}</span>}</button>}
           {can('content.view') && <button className={section === 'content' ? 'selected' : ''} onClick={() => setSection('content')}><ClipboardList size={18} />Treści</button>}
           {can('health.view') && <button className={section === 'health' ? 'selected' : ''} onClick={() => setSection('health')}><Activity size={18} />Stan systemu</button>}
           {can('audit.view') && <button className={section === 'audit' ? 'selected' : ''} onClick={() => setSection('audit')}><ClipboardList size={18} />Dziennik</button>}
@@ -941,7 +1145,7 @@ function AdminApp() {
         </header>
         {error && <div className="notice error" role="alert"><AlertCircle size={17} />{error}</div>}
         {success && <div className="notice success" role="status"><CheckCircle2 size={17} />{success}</div>}
-        {!(['overview.view', 'analytics.view', 'users.view', 'reports.view', 'support.view', 'content.view', 'health.view', 'audit.view', 'settings.view', 'settings.manage', 'announcements.view', 'announcements.manage', 'admins.view'] as Permission[]).some((permission) => can(permission))
+        {!(['overview.view', 'analytics.view', 'users.view', 'reports.view', 'chat.messages.view', 'support.view', 'content.view', 'health.view', 'audit.view', 'settings.view', 'settings.manage', 'announcements.view', 'announcements.manage', 'admins.view'] as Permission[]).some((permission) => can(permission))
           && <p className="empty-state">To konto nie ma jeszcze dostępu do żadnej sekcji panelu. Poproś Super Administratora o przyznanie uprawnień.</p>}
         {section === 'overview' && overview && (
           <section className="overview-section">
@@ -963,7 +1167,7 @@ function AdminApp() {
         )}
         {section === 'analytics' && analytics && (
           <section className="overview-section">
-            <div className="section-toolbar"><div><h2>Statystyki platformy</h2><p>Dane kont i aktywności administracyjnej z API.</p></div><button className="secondary-button" onClick={() => void loadPanel()}>Odśwież</button></div>
+            <div className="section-toolbar"><div><h2>Statystyki platformy</h2><p>Dane kont i aktywności administracyjnej z API.</p></div><div className="section-actions"><button className="secondary-button" onClick={exportAnalyticsCsv}>Eksportuj CSV</button><button className="secondary-button" onClick={() => void loadPanel()}>Odśwież</button></div></div>
             <div className="stats-grid">
               <StatCard label="Konta łącznie" value={analytics.totalUsers} icon={<UsersRound />} />
               <StatCard label="Aktywne konta" value={analytics.activeUsers} icon={<Activity />} />
@@ -983,7 +1187,7 @@ function AdminApp() {
                 })}
               </div>
             </section>
-            <p className="data-note">Panel nie raportuje odsłon, czasu spędzonego w serwisie ani aktywności feedu, ponieważ posty i interakcje są prototypowe i nie są zbierane centralnie.</p>
+            <p className="data-note">Raport obejmuje wyłącznie dane rejestrowane przez API. Odsłony, czas spędzony w serwisie i szczegółowa aktywność feedu nie są obecnie mierzone.</p>
           </section>
         )}
         {section === 'health' && health && (
@@ -1002,10 +1206,11 @@ function AdminApp() {
         )}
         {section === 'audit' && (
           <section className="data-section">
-            <div className="section-toolbar"><div><h2>Historia zmian</h2><p>Ostatnie 200 udanych działań zmieniających dane w panelu.</p></div><button className="secondary-button" onClick={() => void loadPanel()}>Odśwież</button></div>
+            <div className="section-toolbar"><div><h2>Historia zmian</h2><p>Ostatnie 500 działań administracyjnych, w tym powody moderacji.</p></div><div className="section-actions"><button className="secondary-button" onClick={exportAuditCsv} disabled={visibleAuditEntries.length === 0}>Eksportuj CSV</button><button className="secondary-button" onClick={() => void loadPanel()}>Odśwież</button></div></div>
+            <label className="search-field"><Search size={16} /><input value={auditSearch} onChange={(event) => setAuditSearch(event.target.value)} placeholder="Szukaj administratora, akcji lub uzasadnienia" /></label>
             <div className="table-wrap"><table><thead><tr><th>Data</th><th>Administrator</th><th>Akcja</th><th>Wynik</th></tr></thead><tbody>
-              {auditEntries.map((entry) => <tr key={entry.id}><td>{formatDate(entry.createdAt)}</td><td><strong>{entry.adminName}</strong><small>{entry.rank}</small></td><td><code>{entry.method} {entry.path}</code></td><td>{entry.statusCode}</td></tr>)}
-              {auditEntries.length === 0 && <tr><td className="empty-cell" colSpan={4}>Brak zapisanych działań.</td></tr>}
+              {visibleAuditEntries.map((entry) => <tr key={entry.id}><td>{formatDate(entry.createdAt)}</td><td><strong>{entry.adminName}</strong><small>{entry.rank}</small></td><td><code>{entry.method} {entry.path}</code>{entry.details && <small>{entry.details}</small>}</td><td>{entry.statusCode}</td></tr>)}
+              {visibleAuditEntries.length === 0 && <tr><td className="empty-cell" colSpan={4}>Brak działań pasujących do wyszukiwania.</td></tr>}
             </tbody></table></div>
           </section>
         )}
@@ -1014,41 +1219,72 @@ function AdminApp() {
             <form className="announcement-form admin-editor" onSubmit={savePlatformSettings}>
               <div><h2>Ustawienia platformy</h2><p>Zmiana dostępności rejestracji wpływa na nowe konta. Logowanie istniejących użytkowników pozostaje aktywne.</p></div>
               <label className="checkbox-label"><input type="checkbox" checked={registrationEnabled} disabled={!can('settings.manage')} onChange={(event) => setRegistrationEnabled(event.target.checked)} />Pozwól na rejestrację nowych kont</label>
+              <label className="checkbox-label"><input type="checkbox" checked={publishingEnabled} disabled={!can('settings.manage')} onChange={(event) => setPublishingEnabled(event.target.checked)} />Pozwól użytkownikom dodawać posty i komentarze</label>
               <div className="form-footer"><small>Ustawienia zapisują się w API i bazie platformy.</small>{can('settings.manage') ? <button className="primary-button" type="submit" disabled={submitting}><Settings size={16} />Zapisz ustawienia</button> : <span className="data-note">Brak uprawnienia do zmiany ustawień.</span>}</div>
             </form>
           </section>
         )}
         {section === 'content' && (
           <section className="data-section">
-            <div className="section-toolbar"><div><h2>Rejestr moderacji</h2><p>{moderatedContent.length} ukrytych elementów.</p></div><button className="secondary-button" onClick={() => void loadPanel()}>Odśwież</button></div>
-            <p className="data-note">Posty, komentarze i wiadomości nadal są przechowywane lokalnie w przeglądarkach. Panel centralnie zapisuje decyzje moderacyjne i ukrywa zgodne elementy u klientów, ale nie może przeglądać ani usuwać wszystkich kopii treści.</p>
-            <div className="report-card-list">{moderatedContent.map((item) => (
-              <article className="moderation-report-card" key={item.reportId}>
-                <header><div><span className={`report-type-pill report-type-${item.targetType}`}>{item.targetType}</span><strong>{item.authorName}</strong></div><small>{formatDate(item.removedAt)}</small></header>
-                {item.contentPreview && <blockquote>{item.contentPreview}</blockquote>}
-                {item.contentUrl && <a className="report-content-link" href={item.contentUrl} target="_blank" rel="noreferrer">Otwórz załącznik</a>}
-                {can('content.manage') && <button className="secondary-button" onClick={() => void restoreModeratedContent(item)}>Przywróć widoczność</button>}
+            <div className="section-toolbar">            <div><h2>Zarządzanie treściami</h2><p>{manageableContent.filter((item) => item.isModerated).length} ukrytych · {manageableContent.length} postów i komentarzy w ostatnich publikacjach.</p></div><button className="secondary-button" onClick={() => void loadPanel()}>Odśwież</button></div>
+            <p className="data-note">Możesz wyszukiwać publiczne posty i komentarze. Ukrycie jest odwracalne i wymaga uzasadnienia; prywatne treści band pozostają poza tym widokiem.</p>
+            <div className="report-filter-group">
+              <label className="search-field"><Search size={16} /><input value={contentSearch} onChange={(event) => setContentSearch(event.target.value)} placeholder="Szukaj treści lub autora" /></label>
+              <label className="report-status-filter">Rodzaj<select value={contentTypeFilter} onChange={(event) => setContentTypeFilter(event.target.value as typeof contentTypeFilter)}><option value="all">Wszystkie</option><option value="post">Posty</option><option value="comment">Komentarze</option></select></label>
+              <label className="report-status-filter">Widoczność<select value={contentStatusFilter} onChange={(event) => setContentStatusFilter(event.target.value as typeof contentStatusFilter)}><option value="all">Wszystkie</option><option value="visible">Widoczne</option><option value="hidden">Ukryte</option></select></label>
+            </div>
+            <div className="report-card-list">            {visibleContent.map((item) => {
+              return <article className="moderation-report-card" key={item.key}>
+                <header><div><span className={`report-type-pill report-type-${item.targetType}`}>{item.targetType === 'post' ? 'Post' : 'Komentarz'}</span><strong>{item.authorName}</strong></div><small>{formatDate(item.createdAt)}</small></header>
+                <blockquote>{item.contentPreview || 'Treść zawiera załącznik bez opisu.'}</blockquote>
+                {item.reportCount > 0 && <span className="chat-moderation-report">{item.reportCount} oczekujących zgłoszeń</span>}
+                {item.isModerated
+                  ? <><p className="data-note">Ukryta{item.moderationReason ? ` · Powód: ${item.moderationReason}` : ''}</p>{can('content.manage') && item.moderationRecordId && <button className="secondary-button" onClick={() => void restoreModeratedContent({ reportId: item.moderationRecordId! })}>Przywróć widoczność</button>}</>
+                  : can('content.manage') && <button className="secondary-button" onClick={() => void moderateContent(item)}>Ukryj z uzasadnieniem</button>}
               </article>
-            ))}
-            {moderatedContent.length === 0 && <p className="empty-state">Brak treści ukrytych przez moderację.</p>}</div>
+            })}
+            {visibleContent.length === 0 && <p className="empty-state">Nie znaleziono treści pasujących do filtrów.</p>}</div>
+          </section>
+        )}
+        {section === 'chats' && can('chat.messages.view') && (
+          <section className="data-section">
+            <div className="section-toolbar"><div><h2>Przegląd prywatnych wiadomości</h2><p>Dostęp do rozmów jest ograniczony uprawnieniem i rejestrowany w dzienniku audytu.</p></div><button className="secondary-button" onClick={() => void refreshAdminChats()}>Odśwież</button></div>
+            <p className="data-note">Przeglądaj wiadomości wyłącznie w celu ochrony bezpieczeństwa użytkowników. Zdjęcia czasowe pozostają dostępne do moderacji przez 30 dni od wysłania.</p>
+            <div className="chat-moderation-list">{adminChatMessages.map((item) => (
+              <article className={`chat-moderation-message ${item.isModerated ? 'is-moderated' : ''}`} key={item.id}>
+                <header><strong>@{item.author.nickname} → @{item.recipient.nickname}</strong><time>{formatDate(item.createdAt)}</time></header>
+                {item.text && <p>{item.text}</p>}
+                {item.mediaUrl && <img src={item.mediaUrl} alt={item.temporarySeconds ? `Zdjęcie czasowe ${item.temporarySeconds}s` : 'Zdjęcie z wiadomości'} loading="lazy" />}
+                {item.temporarySeconds ? <small>Zdjęcie czasowe · {item.temporarySeconds} sekund{item.expiresAt ? ` · wygasa ${formatDate(item.expiresAt)}` : ''}</small> : null}
+                {item.hasPendingReport && <span className="chat-moderation-report">Zgłoszona wiadomość</span>}
+                {item.isModerated ? <span className="chat-moderation-hidden">Ukryta</span>
+                  : can('chat.messages.moderate') && <button className="secondary-button" onClick={() => void moderateChatMessage(item)}><Trash2 size={15} />Ukryj wiadomość i zdjęcie</button>}
+              </article>
+            ))}{adminChatMessages.length === 0 && <p className="empty-state">Brak prywatnych wiadomości do przeglądu.</p>}</div>
           </section>
         )}
         {section === 'support' && (
           <section className="support-center">
-            <div className="section-toolbar"><div><h2>Sprawy użytkowników</h2><p>{supportTickets.filter((ticket) => ticket.status !== 'resolved').length} otwartych · {supportTickets.length} łącznie</p></div><button className="secondary-button" onClick={() => void loadPanel()}>Odśwież</button></div>
+            <div className="section-toolbar"><div><h2>Sprawy użytkowników</h2><p>{supportTickets.filter((ticket) => ticket.status !== 'resolved' && ticket.status !== 'closed').length} otwartych · {supportTickets.length} łącznie</p></div><button className="secondary-button" onClick={() => void loadPanel()}>Odśwież</button></div>
             <div className="support-ticket-list">{supportTickets.map((ticket) => {
               const active = activeSupportTicketId === ticket.id
-              const statusLabel = ticket.status === 'resolved' ? 'Rozwiązana' : ticket.status === 'in_progress' ? 'W trakcie' : 'Otwarta'
+              const statusLabel = ticket.status === 'resolved' ? 'Rozwiązana' : ticket.status === 'closed' ? 'Zamknięta' : ticket.status === 'in_progress' ? 'W trakcie' : 'Otwarta'
               return <article className={`support-ticket ${active ? 'selected' : ''}`} key={ticket.id}>
                 <button className="support-ticket-summary" onClick={() => setActiveSupportTicketId(active ? '' : ticket.id)}><span className={`ticket-status status-${ticket.status}`}>{statusLabel}</span><strong>{ticket.subject}</strong><small>{ticket.user.name} · @{ticket.user.nickname} · {formatDate(ticket.updatedAt)}</small></button>
                 {active && <div className="support-ticket-detail">
                   <p className="data-note">Kategoria: {ticket.category}</p>
+                  {can('support.manage') && <div className="support-assignment-controls">
+                    <label className="report-status-filter">Priorytet<select value={ticket.priority ?? 'normal'} onChange={(event) => void updateSupportTicket(ticket, { priority: event.target.value as SupportTicket['priority'] })}><option value="low">Niski</option><option value="normal">Normalny</option><option value="high">Wysoki</option><option value="urgent">Pilny</option></select></label>
+                    <label className="report-status-filter">Przypisany moderator<select value={ticket.assigneeId ?? ''} onChange={(event) => void updateSupportTicket(ticket, { assigneeId: event.target.value })}><option value="">Nieprzypisana</option>{supportAssignees.map((assignee) => <option key={assignee.id} value={assignee.id}>{assignee.name} · {assignee.rank}</option>)}</select></label>
+                  </div>}
                   <div className="support-ticket-messages">{ticket.messages.map((item) => <div className={`support-message ${item.authorType}`} key={item.id}><strong>{item.authorName} · {item.authorType === 'admin' ? 'administracja' : 'użytkownik'}</strong><p>{item.message}</p><small>{formatDate(item.createdAt)}</small></div>)}</div>
+                  {ticket.internalNotes?.length > 0 && <div className="support-internal-notes"><strong>Notatki wewnętrzne — widoczne tylko dla administracji</strong>{ticket.internalNotes.map((note) => <p key={note.id}><span>{note.adminName} · {formatDate(note.createdAt)}</span>{note.note}</p>)}</div>}
                   {can('support.manage') && <>
                     <label className="report-status-filter">Status
-                      <select value={ticket.status} onChange={(event) => void updateSupportTicket(ticket, { status: event.target.value as SupportTicket['status'] })}><option value="open">Otwarta</option><option value="in_progress">W trakcie</option><option value="resolved">Rozwiązana</option></select>
+                      <select value={ticket.status} onChange={(event) => void updateSupportTicket(ticket, { status: event.target.value as SupportTicket['status'] })}><option value="open">Otwarta</option><option value="in_progress">W trakcie</option><option value="resolved">Rozwiązana</option><option value="closed">Zamknięta</option></select>
                     </label>
-                    {ticket.status !== 'resolved' && <form className="support-reply-form" onSubmit={(event) => { event.preventDefault(); if (supportReply.trim()) void updateSupportTicket(ticket, { reply: supportReply.trim() }) }}><textarea value={supportReply} onChange={(event) => setSupportReply(event.target.value)} placeholder="Odpowiedz użytkownikowi..." maxLength={5000} required /><button className="primary-button" type="submit" disabled={submitting || !supportReply.trim()}><Send size={15} />Wyślij odpowiedź</button></form>}
+                    {ticket.status !== 'resolved' && ticket.status !== 'closed' && <form className="support-reply-form" onSubmit={(event) => { event.preventDefault(); if (supportReply.trim()) void updateSupportTicket(ticket, { reply: supportReply.trim() }) }}><textarea value={supportReply} onChange={(event) => setSupportReply(event.target.value)} placeholder="Odpowiedz użytkownikowi..." maxLength={5000} required /><button className="primary-button" type="submit" disabled={submitting || !supportReply.trim()}><Send size={15} />Wyślij odpowiedź</button></form>}
+                    <form className="support-reply-form" onSubmit={(event) => { event.preventDefault(); if (supportInternalNote.trim()) void updateSupportTicket(ticket, { internalNote: supportInternalNote.trim() }) }}><textarea value={supportInternalNote} onChange={(event) => setSupportInternalNote(event.target.value)} placeholder="Notatka wewnętrzna (niewidoczna dla użytkownika)..." maxLength={1000} required /><button className="secondary-button" type="submit" disabled={submitting || !supportInternalNote.trim()}>Dodaj notatkę</button></form>
                   </>}
                 </div>}
               </article>
@@ -1097,6 +1333,7 @@ function AdminApp() {
                         <span className={`report-type-pill report-type-${report.targetType}`}>{reportTypeLabels[report.targetType]}</span>
                         <span className="report-category-pill">{report.reasonCategoryLabel || reportCategoryLabels[report.reasonCategory || 'other']}</span>
                         <span className={`status-pill ${report.status === 'pending' ? 'blocked' : 'active'}`}>{report.status === 'pending' ? 'Do sprawdzenia' : 'Zakończone'}</span>
+                        {report.status === 'pending' && <span className={`report-priority-pill report-priority-${report.priority ?? 'normal'}`}>{({ low: 'Niski', normal: 'Normalny', high: 'Wysoki', urgent: 'Pilny' })[report.priority ?? 'normal']}</span>}
                       </div>
                       <small>{formatDate(report.createdAt)}</small>
                     </header>
@@ -1107,10 +1344,17 @@ function AdminApp() {
                       <span><small>Zgłaszający</small><strong>{report.reporter.name}</strong></span>
                       <span><small>Osoba / autor treści</small><strong>{report.target.name}</strong>{report.target.nickname && <small>@{report.target.nickname}</small>}</span>
                     </div>
+                    {report.assignee && <p className="report-assignee-summary"><strong>Przypisano:</strong> {report.assignee.name} · {report.assignee.rank}</p>}
+                    {report.internalNotes?.length > 0 && <div className="support-internal-notes"><strong>Notatki wewnętrzne</strong>{report.internalNotes.map((note) => <p key={note.id}><span>{note.adminName} · {formatDate(note.createdAt)}</span>{note.note}</p>)}</div>}
+                    {report.status === 'pending' && can('reports.manage') && <div className="support-assignment-controls">
+                      <label className="report-status-filter">Priorytet<select value={report.priority ?? 'normal'} onChange={(event) => void updateReportTriage(report, { priority: event.target.value as ModerationReport['priority'] })}><option value="low">Niski</option><option value="normal">Normalny</option><option value="high">Wysoki</option><option value="urgent">Pilny</option></select></label>
+                      <label className="report-status-filter">Moderator<select value={report.assigneeId ?? ''} onChange={(event) => void updateReportTriage(report, { assigneeId: event.target.value })}><option value="">Nieprzypisane</option>{reportAssignees.map((assignee) => <option key={assignee.id} value={assignee.id}>{assignee.name} · {assignee.rank}</option>)}</select></label>
+                      <form className="support-reply-form" onSubmit={(event) => { event.preventDefault(); if (reportInternalNotes[report.id]?.trim()) void updateReportTriage(report, { internalNote: reportInternalNotes[report.id].trim() }) }}><textarea value={reportInternalNotes[report.id] ?? ''} onChange={(event) => setReportInternalNotes((notes) => ({ ...notes, [report.id]: event.target.value }))} placeholder="Notatka wewnętrzna do zgłoszenia..." maxLength={1000} required /><button className="secondary-button" type="submit" disabled={submitting || !reportInternalNotes[report.id]?.trim()}>Dodaj notatkę</button></form>
+                    </div>}
                     {report.status === 'resolved' && <p className="report-decision-summary"><strong>Decyzja:</strong> {report.decision ? reportDecisionLabels[report.decision] : 'Sprawdzone'}{report.decisionNote && ` · ${report.decisionNote}`}<small>{report.decidedAt ? `Rozpatrzono ${formatDate(report.decidedAt)}` : ''}{report.decidedBy ? ` przez ${report.decidedBy}` : ''}</small></p>}
                     {report.status === 'pending' && <div className="report-card-actions">
                       {can('reports.manage') && <button className="primary-button" type="button" onClick={() => openReportDecision(report)}><CheckCircle2 size={15} />Rozpatrz zgłoszenie</button>}
-                      <small>{report.targetType !== 'profile' ? 'Treści społecznościowe i wiadomości są obecnie przechowywane lokalnie w prototypie; usunięcie z panelu ukryje je u klientów, którzy mają ten sam element, ale nie zastępuje centralnego magazynu treści.' : ''}</small>
+                      <small>{report.targetType !== 'profile' ? 'Treść jest powiązana z elementem przechowywanym przez API. Decyzja moderacyjna ukryje ją w serwisie i pozostawi wpis w rejestrze moderacji.' : ''}</small>
                     </div>}
                   </article>
                 ))}
@@ -1193,6 +1437,7 @@ function AdminApp() {
                               else { setBlockingUser(user); setBlockDurationDays(7); setBlockIp(false) }
                             }}><Ban size={14} />{user.blockedAt ? 'Odblokuj' : 'Zablokuj'}</button>}
                             {can('users.delete') && <button className="row-action delete-user-action" onClick={() => void deleteUser(user)}><UserRoundX size={14} />Usuń</button>}
+                            {can('users.sessions.revoke') && <button className="row-action" onClick={() => void revokeUserSessions(user)}><LogOut size={14} />Wyloguj sesje</button>}
                             {can('users.message') && <button className="row-action message-user-action" disabled title="Dostępne po uruchomieniu komunikatora 1:1"><MessageCircle size={14} />Napisz</button>}
                           </div>}</td>
                     </tr>

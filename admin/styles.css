@@ -85,6 +85,11 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 3px
 .report-type-photo, .report-type-video { background: #f3efff; color: #6d4c9c; }
 .report-type-comment, .report-type-message { background: #fff5e7; color: #93651a; }
 .report-category-pill { display: inline-flex; align-items: center; width: fit-content; border: 1px solid #e5e8df; border-radius: 20px; padding: 4px 8px; background: #fafbf8; color: #596253; font-size: 9px; font-weight: 600; }
+.report-priority-pill { display: inline-flex; align-items: center; width: fit-content; border-radius: 20px; padding: 5px 8px; background: #edf0eb; color: #596253; font-size: 9px; font-weight: 700; }
+.report-priority-high { background: #fff3df; color: #916119; }
+.report-priority-urgent { background: #fff0ee; color: #a3483e; }
+.report-assignee-summary { margin: 0; color: #656b61; font-size: 11px; }
+.section-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .moderation-report-reason { margin: 0; color: #454b41; font-size: 12px; line-height: 1.5; }
 .moderation-report-card blockquote, .report-decision-dialog blockquote { margin: 0; padding: 11px 13px; border-left: 3px solid #dfe7d8; border-radius: 0 6px 6px 0; background: #fafbf8; color: #62685d; font-size: 11px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
 .report-content-link { width: fit-content; color: #416c3d; font-size: 11px; font-weight: 700; text-decoration: none; }
@@ -243,6 +248,17 @@ td small { margin-top: 4px; color: #969a92; font-size: 9px; white-space: normal;
 .notice.error { border: 1px solid #f0d0cb; background: #fff2ef; color: #9b4037; }
 .notice.success { border: 1px solid #d8e8cf; background: #f1f8ec; color: #4b713f; }
 .admin-card, .health-card { padding: 17px; border: 1px solid var(--line); border-radius: 9px; background: #fff; }
+.chat-moderation-list { display: grid; gap: 10px; }
+.chat-moderation-message { display: grid; gap: 8px; padding: 14px; border: 1px solid var(--line); border-radius: 8px; background: #fff; }
+.chat-moderation-message.is-moderated { opacity: .7; background: #f7f8f5; }
+.chat-moderation-message > header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.chat-moderation-message > header strong { color: #354232; font-size: 11px; }
+.chat-moderation-message > header time, .chat-moderation-message > small { color: #898f84; font-size: 9px; }
+.chat-moderation-message > p { margin: 0; color: #454b42; font-size: 11px; line-height: 1.55; overflow-wrap: anywhere; }
+.chat-moderation-message > img { width: min(360px, 100%); max-height: 300px; border-radius: 6px; object-fit: contain; background: #f0f2ed; }
+.chat-moderation-message > button { justify-self: start; }
+.chat-moderation-report, .chat-moderation-hidden { justify-self: start; padding: 4px 7px; border-radius: 4px; background: #fff3e4; color: #916428; font-size: 9px; font-weight: 700; }
+.chat-moderation-hidden { background: #eef0eb; color: #777e72; }
 .analytics-chart { display: grid; gap: 16px; }
 .analytics-chart h3 { margin: 0; font: 700 13px/1.4 var(--font-display); }
 .analytics-chart p { margin: 4px 0 0; color: var(--muted); font-size: 10px; }
@@ -264,7 +280,13 @@ td small { margin-top: 4px; color: #969a92; font-size: 9px; white-space: normal;
 .support-ticket-summary { display: grid; justify-items: start; width: 100%; gap: 7px; padding: 14px; border: 0; background: transparent; text-align: left; }
 .support-ticket-summary strong { font-size: 12px; }
 .support-ticket-summary small { color: var(--muted); font-size: 9px; }
+.support-ticket .ticket-status.status-closed { background: #f0f0f0; color: #666; }
 .support-ticket-detail { display: grid; gap: 12px; padding: 0 14px 14px; }
+.support-assignment-controls { display: flex; flex-wrap: wrap; gap: 12px; }
+.support-internal-notes { display: grid; gap: 8px; padding: 11px; border: 1px dashed #d5dacd; border-radius: 6px; background: #fbfcf8; }
+.support-internal-notes > strong { color: #59624f; font-size: 10px; }
+.support-internal-notes p { display: grid; gap: 4px; margin: 0; color: #5d6258; font-size: 11px; white-space: pre-wrap; }
+.support-internal-notes p span { color: var(--muted); font-size: 9px; }
 .support-ticket-detail > .data-note { margin: 0; }
 .support-ticket-messages { display: grid; gap: 8px; max-height: 360px; overflow: auto; }
 .support-message { display: grid; gap: 5px; padding: 10px; border-radius: 6px; background: #f7f8f5; }

@@ -68,6 +68,7 @@ app.use(express.json({ limit: '2mb' }))
 const authRateLimit = rateLimit({ windowMs: 15 * 60 * 1000, limit: 12, standardHeaders: true, legacyHeaders: false })
 const adminMutationLimit = rateLimit({ windowMs: 15 * 60 * 1000, limit: 60, standardHeaders: true, legacyHeaders: false })
 const supportCreationLimit = rateLimit({ windowMs: 60 * 60 * 1000, limit: 5, standardHeaders: true, legacyHeaders: false })
+const supportReplyLimit = rateLimit({ windowMs: 60 * 60 * 1000, limit: 30, standardHeaders: true, legacyHeaders: false })
 app.use('/api', (request, response, next) => {
   const origin = request.get('origin')
   if (origin && !isAllowedOrigin(origin)) return response.status(403).json({ error: 'Niedozwolone źródło żądania.' })
@@ -83,7 +84,7 @@ app.use('/api', (request, response, next) => {
 })
 
 function emptyStore() {
-  return { users: [], announcements: [], admins: [], rankPermissionTemplates: {}, reports: [], reportNotifications: [], socialNotifications: [], socialChatMessages: [], socialBands: [], socialAlbums: [], moderatedItems: [], supportTickets: [], auditLog: [], platformSettings: { registrationEnabled: true }, deletedUsers: [], ipBlocks: [], socialPosts: [], socialMedia: [], socialCrewLinks: [], socialCrewInvitations: [], socialBlocks: [], socialMutes: [] }
+  return { users: [], announcements: [], admins: [], rankPermissionTemplates: {}, reports: [], reportNotifications: [], socialNotifications: [], socialChatMessages: [], socialChatRequests: [], socialBands: [], socialAlbums: [], moderatedItems: [], supportTickets: [], auditLog: [], platformSettings: { registrationEnabled: true }, deletedUsers: [], ipBlocks: [], socialPosts: [], socialMedia: [], socialCrewLinks: [], socialCrewInvitations: [], socialBlocks: [], socialMutes: [] }
 }
 
 function normalizeStore(store) {
@@ -114,6 +115,7 @@ function normalizeStore(store) {
     auditLog: Array.isArray(store.auditLog) ? store.auditLog : [],
     platformSettings: {
       registrationEnabled: store.platformSettings?.registrationEnabled !== false,
+      publishingEnabled: store.platformSettings?.publishingEnabled !== false,
     },
     deletedUsers: Array.isArray(store.deletedUsers) ? store.deletedUsers : [],
     ipBlocks: Array.isArray(store.ipBlocks) ? store.ipBlocks : [],
@@ -123,6 +125,7 @@ function normalizeStore(store) {
     socialCrewInvitations: Array.isArray(store.socialCrewInvitations) ? store.socialCrewInvitations : [],
     socialNotifications: Array.isArray(store.socialNotifications) ? store.socialNotifications : [],
     socialChatMessages: Array.isArray(store.socialChatMessages) ? store.socialChatMessages : [],
+    socialChatRequests: Array.isArray(store.socialChatRequests) ? store.socialChatRequests : [],
     socialBands: Array.isArray(store.socialBands) ? store.socialBands : [],
     socialAlbums: Array.isArray(store.socialAlbums) ? store.socialAlbums : [],
     socialBlocks: Array.isArray(store.socialBlocks) ? store.socialBlocks : [],
@@ -143,6 +146,10 @@ async function initializeDatabase() {
     [JSON.stringify(emptyStore())],
   )
   await database.query(`
+    CREATE TABLE IF NOT EXISTS youtopic_user_login_metadata (
+      user_id TEXT PRIMARY KEY,
+      last_ip_hash TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS youtopic_social_media (
       id UUID PRIMARY KEY,
       owner_id TEXT NOT NULL,
@@ -161,6 +168,14 @@ async function initializeDatabase() {
       created_at BIGINT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS youtopic_social_comment_ids (id BIGSERIAL PRIMARY KEY);
+  `)
+  await database.query(`
+    INSERT INTO youtopic_user_login_metadata (user_id, last_ip_hash)
+    SELECT user_entry->>'id', user_entry->>'lastIpHash'
+    FROM youtopic_auth_store
+    CROSS JOIN LATERAL jsonb_array_elements(state->'users') AS users(user_entry)
+    WHERE user_entry->>'id' IS NOT NULL AND user_entry->>'lastIpHash' IS NOT NULL
+    ON CONFLICT (user_id) DO NOTHING
   `)
   await database.query('ALTER TABLE youtopic_social_posts ADD COLUMN IF NOT EXISTS band_id TEXT')
   await database.query("SELECT setval(pg_get_serial_sequence('youtopic_social_posts', 'id'), GREATEST(COALESCE((SELECT MAX(id) FROM youtopic_social_posts), 0), 1000000000))")
@@ -187,7 +202,7 @@ function updateStore(update) {
         await client.query('BEGIN')
         const { rows } = await client.query('SELECT state FROM youtopic_auth_store WHERE id = 1 FOR UPDATE')
         const store = normalizeStore(rows[0]?.state ?? emptyStore())
-        const result = await update(store)
+        const result = await update(store, client)
         await client.query('UPDATE youtopic_auth_store SET state = $1::jsonb WHERE id = 1', [JSON.stringify(store)])
         await client.query('COMMIT')
         return result
@@ -214,6 +229,41 @@ function updateStore(update) {
   })
   storeQueue = operation.catch(() => {})
   return operation
+}
+
+async function recordSuccessfulLogin(userId, ipHash) {
+  if (!database) {
+    return updateStore((store) => {
+      const user = store.users.find((item) => item.id === userId)
+      if (!user || isUserBlocked(user)) return false
+      user.lastIpHash = ipHash
+      return true
+    })
+  }
+
+  const { rows } = await database.query(`
+    WITH auth_state AS (
+      SELECT state FROM youtopic_auth_store WHERE id = 1 FOR UPDATE
+    )
+    INSERT INTO youtopic_user_login_metadata (user_id, last_ip_hash)
+    SELECT $1, $2
+    WHERE EXISTS (
+      SELECT 1
+      FROM auth_state
+      CROSS JOIN LATERAL jsonb_array_elements(auth_state.state->'users') AS users(user_entry)
+      WHERE user_entry->>'id' = $1
+        AND NOT (
+          COALESCE(NULLIF(user_entry->>'blockedAt', '')::numeric, 0) <> 0
+          AND (
+            NULLIF(user_entry->>'blockedUntil', '') IS NULL
+            OR NULLIF(user_entry->>'blockedUntil', '')::numeric > $3
+          )
+        )
+    )
+    ON CONFLICT (user_id) DO UPDATE SET last_ip_hash = EXCLUDED.last_ip_hash
+    RETURNING user_id
+  `, [userId, ipHash, Date.now()])
+  return rows.length > 0
 }
 
 function digest(value) {
@@ -602,6 +652,24 @@ async function readSocialPosts(userId, store = null, { before, beforeId, limit =
     .map((post) => socialPostForUser(post, userId, store.users))
 }
 
+function hasPrivateChatAccess(store, firstUserId, secondUserId) {
+  return isCrewMember(store, firstUserId, secondUserId)
+    || store.socialChatRequests.some((item) => item.status === 'accepted'
+      && ((item.fromId === firstUserId && item.toId === secondUserId)
+        || (item.fromId === secondUserId && item.toId === firstUserId)))
+}
+
+function privateChatRequestBetween(store, firstUserId, secondUserId) {
+  return store.socialChatRequests.find((item) =>
+    (item.fromId === firstUserId && item.toId === secondUserId)
+    || (item.fromId === secondUserId && item.toId === firstUserId))
+}
+
+function isChatMessageModerated(store, message) {
+  return store.moderatedItems.some((item) => item.targetType === 'message'
+    && item.targetId === `message:${message.id}` && item.targetUserId === message.authorId)
+}
+
 async function readMedia(mediaId, ownerId, allowPublished = false) {
   if (database) {
     const { rows } = await database.query('SELECT owner_id, content_type, data FROM youtopic_social_media WHERE id = $1', [mediaId])
@@ -629,7 +697,13 @@ async function readMedia(mediaId, ownerId, allowPublished = false) {
       album.photos.some((photo) => photo.mediaId === mediaId)
       && !isSocialBlocked(store, ownerId, album.ownerId)
       && canViewSocialProfile(store, ownerId, store.users.find((user) => user.id === album.ownerId)))
-    return postVisible || albumVisible ? media : null
+    const chatVisible = store.socialChatMessages.some((message) => message.mediaId === mediaId
+      && !isChatMessageModerated(store, message)
+      && (message.authorId === ownerId || message.recipientId === ownerId)
+      && !isSocialBlocked(store, message.authorId, message.recipientId)
+      && hasPrivateChatAccess(store, message.authorId, message.recipientId)
+      && (!message.expiresAt || message.expiresAt > Date.now()))
+    return postVisible || albumVisible || chatVisible ? media : null
   }
   const store = await readStore()
   const media = store.socialMedia.find((item) => item.id === mediaId && item.ownerId === ownerId)
@@ -648,7 +722,13 @@ async function readMedia(mediaId, ownerId, allowPublished = false) {
     album.photos.some((photo) => photo.mediaId === mediaId)
     && !isSocialBlocked(store, ownerId, album.ownerId)
     && canViewSocialProfile(store, ownerId, store.users.find((user) => user.id === album.ownerId)))
-  const publishedMedia = isPublished || albumPublished ? store.socialMedia.find((item) => item.id === mediaId) : null
+  const chatPublished = store.socialChatMessages.some((message) => message.mediaId === mediaId
+    && !isChatMessageModerated(store, message)
+    && (message.authorId === ownerId || message.recipientId === ownerId)
+    && !isSocialBlocked(store, message.authorId, message.recipientId)
+    && hasPrivateChatAccess(store, message.authorId, message.recipientId)
+    && (!message.expiresAt || message.expiresAt > Date.now()))
+  const publishedMedia = isPublished || albumPublished || chatPublished ? store.socialMedia.find((item) => item.id === mediaId) : null
   return publishedMedia ? { content_type: publishedMedia.contentType, data: Buffer.from(publishedMedia.data, 'base64') } : null
 }
 
@@ -715,9 +795,12 @@ app.post('/api/media', requireAuthentication, mediaUploadLimit, express.raw({ ty
 
 app.get('/api/media/:mediaId', requireAuthentication, async (request, response) => {
   if (!/^[\da-f-]{36}$/i.test(request.params.mediaId)) return response.status(404).json({ error: 'Nie znaleziono pliku.' })
+  const associatedChatMessage = request.authStore.socialChatMessages.find((message) => message.mediaId === request.params.mediaId)
+  if (associatedChatMessage && isChatMessageModerated(request.authStore, associatedChatMessage)) return response.status(404).json({ error: 'Ten załącznik został ukryty przez moderację.' })
   const media = await readMedia(request.params.mediaId, request.authUser.id, true)
   if (!media) return response.status(404).json({ error: 'Nie znaleziono pliku.' })
-  const baseHeaders = { 'Content-Type': media.content_type, 'Accept-Ranges': 'bytes', 'Cache-Control': 'private, max-age=3600', 'X-Content-Type-Options': 'nosniff' }
+  const isTemporaryChatMedia = request.authStore.socialChatMessages.some((message) => message.mediaId === request.params.mediaId && message.temporarySeconds)
+  const baseHeaders = { 'Content-Type': media.content_type, 'Accept-Ranges': 'bytes', 'Cache-Control': isTemporaryChatMedia ? 'private, no-store' : 'private, max-age=3600', 'X-Content-Type-Options': 'nosniff' }
   const range = request.get('range')
   if (range && /^video\//.test(media.content_type)) {
     const match = /^bytes=(\d*)-(\d*)$/.exec(range)
@@ -1167,9 +1250,9 @@ app.get('/api/notifications', requireAuthentication, async (request, response) =
       && !(item.type === 'chat_message' && store.socialMutes.some((mute) => mute.userId === request.authUser.id && mute.mutedUserId === item.actorId)))
     .sort((first, second) => second.createdAt - first.createdAt)
     .slice(0, 100)
-    .map(({ id, actorId, type, message, postId, chatHandle, crewInvitationId, createdAt, readAt }) => ({
+    .map(({ id, actorId, type, message, postId, chatHandle, crewInvitationId, ticketId, createdAt, readAt }) => ({
       id, actor: usersById.has(actorId) ? publicSocialPerson(usersById.get(actorId)) : null,
-      type, message, postId, chatHandle, crewInvitationId, createdAt, readAt,
+      type, message, postId, chatHandle, crewInvitationId, ticketId, createdAt, readAt,
     }))
   response.set('Cache-Control', 'no-store')
   return response.json({ notifications })
@@ -1208,27 +1291,129 @@ app.get('/api/chat', requireAuthentication, socialDirectoryLimit, async (request
   const store = request.authStore
   const recipientHandle = typeof request.query.with === 'string' ? request.query.with : ''
   const recipient = scope === 'room' ? store.users.find((user) => defaultNickname(user) === recipientHandle) : null
-  if (scope === 'room' && (!recipient || isSocialBlocked(store, request.authUser.id, recipient.id) || !isCrewMember(store, request.authUser.id, recipient.id))) {
-    return response.status(403).json({ error: 'Prywatny czat jest dostępny po zaakceptowaniu zaproszenia do Ekipy.' })
+  if (scope === 'room' && (!recipient || isSocialBlocked(store, request.authUser.id, recipient.id)
+    || !hasPrivateChatAccess(store, request.authUser.id, recipient.id))) {
+    return response.status(403).json({ error: 'Prywatny czat wymaga zaakceptowania zaproszenia do rozmowy lub członkostwa w Ekipie.' })
   }
   const messages = store.socialChatMessages
     .filter((item) => store.users.some((user) => user.id === item.authorId)
+      && !isChatMessageModerated(store, item)
       && (scope !== 'room' || store.users.some((user) => user.id === item.recipientId))
       && (scope !== 'public' || !isSocialBlocked(store, request.authUser.id, item.authorId))
       && item.scope === scope && (scope === 'public'
       || ((item.authorId === request.authUser.id && item.recipientId === recipient.id)
         || (item.authorId === recipient.id && item.recipientId === request.authUser.id))))
     .slice(-200)
-    .map((item) => ({
-      id: item.id,
-      author: publicSocialPerson(store.users.find((user) => user.id === item.authorId)),
-      scope: item.scope,
-      recipientHandle: item.recipientId ? defaultNickname(store.users.find((user) => user.id === item.recipientId)) : undefined,
-      text: item.text,
-      time: new Intl.DateTimeFormat('pl-PL', { hour: '2-digit', minute: '2-digit' }).format(item.createdAt),
-      createdAt: item.createdAt,
-    }))
+    .map((item) => chatMessageForUser(item, store))
   return response.json({ messages })
+})
+
+function chatMessageForUser(item, store) {
+  const expiredForRecipient = item.temporarySeconds && item.recipientId && item.recipientId !== item.authorId
+    && item.expiresAt && item.expiresAt <= Date.now()
+  return {
+    id: item.id,
+    author: publicSocialPerson(store.users.find((user) => user.id === item.authorId)),
+    scope: item.scope,
+    recipientHandle: item.recipientId ? defaultNickname(store.users.find((user) => user.id === item.recipientId)) : undefined,
+    text: item.text,
+    mediaUrl: item.mediaId && !expiredForRecipient ? `/api/media/${item.mediaId}` : undefined,
+    mediaType: item.mediaType,
+    temporarySeconds: item.temporarySeconds,
+    expiresAt: item.expiresAt,
+    time: new Intl.DateTimeFormat('pl-PL', { hour: '2-digit', minute: '2-digit' }).format(item.createdAt),
+    createdAt: item.createdAt,
+  }
+}
+
+app.get('/api/chat/requests', requireAuthentication, async (request, response) => {
+  response.set('Cache-Control', 'no-store')
+  const store = request.authStore
+  const requests = store.socialChatRequests
+    .filter((item) => item.fromId === request.authUser.id || item.toId === request.authUser.id)
+    .map((item) => {
+      const otherId = item.fromId === request.authUser.id ? item.toId : item.fromId
+      const other = store.users.find((user) => user.id === otherId)
+      if (!other || isSocialBlocked(store, request.authUser.id, otherId)) return null
+      const latestMessage = store.socialChatMessages.find((message) =>
+        message.scope === 'room'
+        && ((message.authorId === item.fromId && message.recipientId === item.toId)
+          || (message.authorId === item.toId && message.recipientId === item.fromId)))
+      return {
+        id: item.id,
+        status: item.status,
+        direction: item.fromId === request.authUser.id ? 'outgoing' : 'incoming',
+        person: publicSocialPerson(other),
+        createdAt: item.createdAt,
+        latestMessage: latestMessage ? chatMessageForUser(latestMessage, store) : null,
+      }
+    })
+    .filter(Boolean)
+    .sort((first, second) => second.createdAt - first.createdAt)
+    .slice(0, 100)
+  return response.json({ requests })
+})
+
+app.post('/api/chat/requests', requireAuthentication, chatMutationLimit, async (request, response) => {
+  const recipientHandle = typeof request.body?.with === 'string' ? request.body.with : ''
+  const text = typeof request.body?.text === 'string' ? request.body.text.trim() : ''
+  if (!recipientHandle || !text || text.length > 1000) return response.status(400).json({ error: 'Wybierz osobę i wpisz wiadomość do zaproszenia (maksymalnie 1000 znaków).' })
+  const result = await updateStore((store) => {
+    const recipient = store.users.find((user) => defaultNickname(user) === recipientHandle && user.emailVerified === true && !isUserBlocked(user))
+    if (!recipient || recipient.id === request.authUser.id || isSocialBlocked(store, request.authUser.id, recipient.id)) {
+      return { error: 'Nie znaleziono dostępnej osoby do rozmowy.', status: 404 }
+    }
+    if (hasPrivateChatAccess(store, request.authUser.id, recipient.id)) return { error: 'Ta rozmowa jest już otwarta.', status: 409 }
+    const existing = privateChatRequestBetween(store, request.authUser.id, recipient.id)
+    if (existing?.status === 'pending') return { error: existing.fromId === request.authUser.id ? 'Zaproszenie do rozmowy czeka na odpowiedź.' : 'Ta osoba już zaprosiła Cię do rozmowy. Odpowiedz na zaproszenie.', status: 409 }
+    const now = Date.now()
+    const invitation = existing
+      ? Object.assign(existing, { fromId: request.authUser.id, toId: recipient.id, status: 'pending', createdAt: now, respondedAt: undefined })
+      : { id: crypto.randomUUID(), fromId: request.authUser.id, toId: recipient.id, status: 'pending', createdAt: now }
+    if (!existing) store.socialChatRequests.push(invitation)
+    const message = { id: crypto.randomUUID(), authorId: request.authUser.id, recipientId: recipient.id, scope: 'room', text, createdAt: now }
+    store.socialChatMessages.push(message)
+    appendSocialNotification(store, recipient.id, request.authUser.id, 'chat_request', 'zaprasza Cię do prywatnej rozmowy.', undefined, defaultNickname(request.authUser))
+    store.socialChatMessages = store.socialChatMessages.slice(-5000)
+    return { request: invitation, message: chatMessageForUser(message, store) }
+  })
+  if (result.error) return response.status(result.status).json({ error: result.error })
+  return response.status(201).json(result)
+})
+
+app.post('/api/chat/requests/:requestId/respond', requireAuthentication, chatMutationLimit, async (request, response) => {
+  if (!['accept', 'decline'].includes(request.body?.action)) return response.status(400).json({ error: 'Wybierz akceptację lub odrzucenie zaproszenia.' })
+  const invitation = await updateStore((store) => {
+    const item = store.socialChatRequests.find((candidate) => candidate.id === request.params.requestId
+      && candidate.toId === request.authUser.id && candidate.status === 'pending')
+    if (!item) return null
+    item.status = request.body.action === 'accept' ? 'accepted' : 'declined'
+    item.respondedAt = Date.now()
+    store.socialNotifications.forEach((notification) => {
+      if (notification.userId === request.authUser.id && notification.actorId === item.fromId && notification.type === 'chat_request') notification.readAt ??= item.respondedAt
+    })
+    if (item.status === 'accepted') appendSocialNotification(store, item.fromId, request.authUser.id, 'chat_request_accepted', 'zaakceptował(a) Twoje zaproszenie do rozmowy.', undefined, defaultNickname(request.authUser))
+    return item
+  })
+  if (!invitation) return response.status(404).json({ error: 'Nie znaleziono oczekującego zaproszenia do rozmowy.' })
+  return response.json({ request: { id: invitation.id, status: invitation.status } })
+})
+
+app.post('/api/chat/messages/:messageId/open', requireAuthentication, chatMutationLimit, async (request, response) => {
+  const message = await updateStore((store) => {
+    const item = store.socialChatMessages.find((candidate) => candidate.id === request.params.messageId
+      && candidate.scope === 'room' && candidate.recipientId === request.authUser.id
+      && candidate.temporarySeconds && hasPrivateChatAccess(store, candidate.authorId, candidate.recipientId)
+      && !isChatMessageModerated(store, candidate)
+      && !isSocialBlocked(store, candidate.authorId, candidate.recipientId))
+    if (!item || item.expiresAt && item.expiresAt <= Date.now()) return null
+    item.openedAt ??= Date.now()
+    item.expiresAt ??= item.openedAt + item.temporarySeconds * 1000
+    return { openedAt: item.openedAt, expiresAt: item.expiresAt }
+  })
+  if (!message) return response.status(404).json({ error: 'To zdjęcie czasowe jest niedostępne.' })
+  response.set('Cache-Control', 'no-store')
+  return response.json(message)
 })
 
 app.post('/api/chat', requireAuthentication, chatMutationLimit, async (request, response) => {
@@ -1236,18 +1421,32 @@ app.post('/api/chat', requireAuthentication, chatMutationLimit, async (request, 
   const scope = request.body?.scope === 'room' ? 'room' : 'public'
   const text = typeof request.body?.text === 'string' ? request.body.text.trim() : ''
   const recipientHandle = typeof request.body?.with === 'string' ? request.body.with : ''
-  if (!text || text.length > 2000) return response.status(400).json({ error: 'Wiadomość musi mieć od 1 do 2000 znaków.' })
+  const mediaId = typeof request.body?.mediaId === 'string' ? request.body.mediaId : ''
+  const temporarySeconds = request.body?.temporarySeconds ?? 0
+  if ((!text && !mediaId) || text.length > 2000) return response.status(400).json({ error: 'Wpisz wiadomość albo dodaj zdjęcie.' })
+  if (mediaId && !/^[\da-f-]{36}$/i.test(mediaId)) return response.status(400).json({ error: 'Nieprawidłowe zdjęcie.' })
+  if (![0, 5, 10, 15].includes(temporarySeconds) || (temporarySeconds && !mediaId)) return response.status(400).json({ error: 'Wybierz poprawny czas zdjęcia.' })
+  const media = mediaId ? await readMedia(mediaId, request.authUser.id) : null
+  if (mediaId && (!media || !media.content_type.startsWith('image/'))) return response.status(400).json({ error: 'Nie znaleziono przesłanego zdjęcia.' })
   const result = await updateStore((store) => {
     const recipient = scope === 'room' ? store.users.find((user) => defaultNickname(user) === recipientHandle) : null
-    if (scope === 'room' && (!recipient || isSocialBlocked(store, request.authUser.id, recipient.id) || !isCrewMember(store, request.authUser.id, recipient.id))) {
-      return { error: 'Prywatny czat jest dostępny po zaakceptowaniu zaproszenia do Ekipy.', status: 403 }
+    if (scope === 'room' && (!recipient || isSocialBlocked(store, request.authUser.id, recipient.id) || !hasPrivateChatAccess(store, request.authUser.id, recipient.id))) {
+      return { error: 'Prywatna rozmowa wymaga zaakceptowania zaproszenia.', status: 403 }
     }
+    if (scope === 'public' && mediaId) return { error: 'Zdjęcia możesz wysyłać w prywatnej rozmowie.', status: 400 }
+    const existingRequest = recipient ? privateChatRequestBetween(store, request.authUser.id, recipient.id) : null
+    if (scope === 'room' && !isCrewMember(store, request.authUser.id, recipient.id) && existingRequest?.status === 'pending' && existingRequest.fromId === request.authUser.id) return { error: 'Poczekaj, aż druga osoba zaakceptuje zaproszenie.', status: 403 }
+    if (scope === 'room' && !isCrewMember(store, request.authUser.id, recipient.id) && existingRequest?.status === 'pending' && existingRequest.toId === request.authUser.id) return { error: 'Najpierw zaakceptuj zaproszenie do rozmowy.', status: 403 }
     const message = {
       id: crypto.randomUUID(),
       authorId: request.authUser.id,
       recipientId: recipient?.id,
       scope,
       text,
+      mediaId: mediaId || undefined,
+      mediaType: media?.content_type,
+      temporarySeconds,
+      expiresAt: undefined,
       createdAt: Date.now(),
     }
     store.socialChatMessages.push(message)
@@ -1261,17 +1460,7 @@ app.post('/api/chat', requireAuthentication, chatMutationLimit, async (request, 
       defaultNickname(request.authUser),
     )
     store.socialChatMessages = store.socialChatMessages.slice(-5000)
-    return {
-      message: {
-        id: message.id,
-        author: publicSocialPerson(request.authUser),
-        scope,
-        recipientHandle: recipient ? defaultNickname(recipient) : undefined,
-        text,
-        time: new Intl.DateTimeFormat('pl-PL', { hour: '2-digit', minute: '2-digit' }).format(message.createdAt),
-        createdAt: message.createdAt,
-      },
-    }
+    return { message: chatMessageForUser(message, store) }
   })
   if (result.error) return response.status(result.status).json({ error: result.error })
   return response.status(201).json(result)
@@ -1348,6 +1537,9 @@ app.get('/api/posts/:postId', requireAuthentication, async (request, response) =
 })
 
 app.post('/api/posts', requireAuthentication, postCreationLimit, async (request, response) => {
+  if (request.authStore.platformSettings.publishingEnabled === false) {
+    return response.status(403).json({ error: 'Publikowanie postów jest tymczasowo wstrzymane przez administrację.' })
+  }
   const { topic, text, imageMediaId, videoMediaId, externalUrl } = request.body ?? {}
   const bandId = typeof request.body?.bandId === 'string' ? request.body.bandId : ''
   const sharedPostId = typeof request.body?.sharedPostId === 'string' ? request.body.sharedPostId : ''
@@ -1518,6 +1710,9 @@ app.post('/api/posts/:postId/pin', requireAuthentication, async (request, respon
 }))
 
 app.post('/api/posts/:postId/comments', requireAuthentication, async (request, response) => {
+  if (request.authStore.platformSettings.publishingEnabled === false) {
+    return response.status(403).json({ error: 'Dodawanie komentarzy jest tymczasowo wstrzymane przez administrację.' })
+  }
   const text = typeof request.body?.text === 'string' ? request.body.text.trim() : ''
   const audioMediaId = typeof request.body?.audioMediaId === 'string' ? request.body.audioMediaId : ''
   const replyToId = Number.isSafeInteger(request.body?.replyToId) ? request.body.replyToId : undefined
@@ -1580,8 +1775,10 @@ function permissionsForAdmin(admin) {
   if (permissions.has('support.manage')) permissions.add('support.view')
   if (permissions.has('settings.manage')) permissions.add('settings.view')
   if (permissions.has('content.manage')) permissions.add('content.view')
+  if (permissions.has('reports.manage')) permissions.add('reports.view')
   if (permissions.has('gallery.photos.delete')) permissions.add('gallery.view')
   if (permissions.has('gallery.view')) permissions.add('users.view')
+  if (permissions.has('chat.messages.moderate')) permissions.add('chat.messages.view')
   return [...permissions]
 }
 
@@ -1747,7 +1944,7 @@ app.get('/api/admin/analytics', requireAdminAuthentication, requireAdminPermissi
     const day = registrationsByDate.get(date)
     if (day) day.registrations += 1
   }
-  const openSupportTickets = store.supportTickets.filter((ticket) => ticket.status !== 'resolved').length
+  const openSupportTickets = store.supportTickets.filter((ticket) => ticket.status !== 'resolved' && ticket.status !== 'closed').length
   return response.json({
     totalUsers: store.users.length,
     verifiedUsers: store.users.filter((user) => user.emailVerified).length,
@@ -1790,9 +1987,109 @@ app.get('/api/admin/health', requireAdminAuthentication, requireAdminPermission(
   })
 })
 
+async function auditChatAccess(admin, path) {
+  await updateStore((store) => appendAdminAudit(store, admin, 'GET', path))
+}
+
+function appendAdminAudit(store, admin, method, path, details = '') {
+  store.auditLog.unshift({
+    id: crypto.randomUUID(),
+    adminId: admin.id,
+    adminName: admin.name,
+    rank: admin.isSuperAdmin ? 'Super Administrator' : admin.rank,
+    method,
+    path,
+    details,
+    statusCode: 200,
+    createdAt: Date.now(),
+  })
+  store.auditLog.length = Math.min(store.auditLog.length, 1000)
+}
+
+app.get('/api/admin/chats', requireAdminAuthentication, requireAdminPermission('chat.messages.view'), async (request, response) => {
+  const store = await readStore()
+  response.set('Cache-Control', 'no-store')
+  await auditChatAccess(request.adminUser, '/api/admin/chats')
+  const messages = store.socialChatMessages
+    .filter((item) => item.scope === 'room' && item.recipientId
+      && store.users.some((user) => user.id === item.authorId)
+      && store.users.some((user) => user.id === item.recipientId))
+    .slice(-3000)
+    .sort((first, second) => first.createdAt - second.createdAt)
+    .map((item) => {
+      const author = store.users.find((user) => user.id === item.authorId)
+      const recipient = store.users.find((user) => user.id === item.recipientId)
+      const isTempExpired = item.temporarySeconds && Date.now() > item.createdAt + 30 * 24 * 60 * 60 * 1000
+      return {
+        id: item.id,
+        author: { id: author.id, name: [author.firstName, author.lastName].filter(Boolean).join(' '), nickname: defaultProfileNickname(author), avatar: author.avatar ?? '' },
+        recipient: { id: recipient.id, name: [recipient.firstName, recipient.lastName].filter(Boolean).join(' '), nickname: defaultProfileNickname(recipient), avatar: recipient.avatar ?? '' },
+        text: item.text,
+        createdAt: item.createdAt,
+        mediaUrl: item.mediaId && !isTempExpired ? `/api/admin/chat/media/${item.mediaId}` : undefined,
+        mediaType: item.mediaType,
+        temporarySeconds: item.temporarySeconds,
+        expiresAt: item.expiresAt,
+        isModerated: store.moderatedItems.some((entry) => entry.targetType === 'message' && entry.targetId === `message:${item.id}`),
+        hasPendingReport: store.reports.some((report) => report.targetType === 'message' && report.targetId === `message:${item.id}` && report.status === 'pending'),
+      }
+    })
+  return response.json({ messages })
+})
+
+app.get('/api/admin/chat/media/:mediaId', requireAdminAuthentication, requireAdminPermission('chat.messages.view'), async (request, response) => {
+  if (!/^[\da-f-]{36}$/i.test(request.params.mediaId)) return response.status(404).json({ error: 'Nie znaleziono załącznika.' })
+  const store = await readStore()
+  await auditChatAccess(request.adminUser, `/api/admin/chat/media/${request.params.mediaId}`)
+  const message = store.socialChatMessages.find((item) => item.scope === 'room' && item.mediaId === request.params.mediaId)
+  if (!message || (message.temporarySeconds && Date.now() > message.createdAt + 30 * 24 * 60 * 60 * 1000)) {
+    return response.status(404).json({ error: 'Załącznik nie jest już dostępny do kontroli.' })
+  }
+  let media
+  if (database) {
+    const { rows } = await database.query('SELECT content_type, data FROM youtopic_social_media WHERE id = $1', [request.params.mediaId])
+    media = rows[0]
+  } else {
+    const item = store.socialMedia.find((entry) => entry.id === request.params.mediaId)
+    if (item) media = { content_type: item.contentType, data: Buffer.from(item.data, 'base64') }
+  }
+  if (!media || !media.content_type.startsWith('image/')) return response.status(404).json({ error: 'Nie znaleziono załącznika.' })
+  response.set({ 'Content-Type': media.content_type, 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff' })
+  return response.send(media.data)
+})
+
+app.delete('/api/admin/chats/:messageId', requireAdminAuthentication, requireAdminPermission('chat.messages.moderate'), adminMutationLimit, async (request, response) => {
+  const result = await updateStore((store) => {
+    const message = store.socialChatMessages.find((item) => item.id === request.params.messageId && item.scope === 'room')
+    if (!message) return null
+    const targetId = `message:${message.id}`
+    if (!store.moderatedItems.some((item) => item.targetType === 'message' && item.targetId === targetId)) {
+      store.moderatedItems.push({ reportId: `admin-chat:${crypto.randomUUID()}`, targetType: 'message', targetId, targetUserId: message.authorId, removedAt: Date.now() })
+    }
+    store.auditLog.unshift({
+      id: crypto.randomUUID(),
+      adminId: request.adminUser.id,
+      adminName: request.adminUser.name,
+      rank: request.adminUser.isSuperAdmin ? 'Super Administrator' : request.adminUser.rank,
+      method: 'DELETE',
+      path: `/api/admin/chats/${request.params.messageId}`,
+      statusCode: 200,
+      createdAt: Date.now(),
+    })
+    store.auditLog.length = Math.min(store.auditLog.length, 1000)
+    return { mediaId: message.mediaId }
+  })
+  if (!result) return response.status(404).json({ error: 'Nie znaleziono wiadomości do moderacji.' })
+  return response.json({ ok: true, removedMediaId: result.mediaId ?? null })
+})
+
 app.get('/api/admin/audit', requireAdminAuthentication, requireAdminPermission('audit.view'), async (_request, response) => {
   const store = await readStore()
-  return response.json({ entries: store.auditLog.slice(0, 200) })
+  const query = typeof _request.query.q === 'string' ? _request.query.q.trim().toLocaleLowerCase('pl-PL') : ''
+  const entries = store.auditLog
+    .filter((entry) => !query || `${entry.adminName} ${entry.rank} ${entry.method} ${entry.path} ${entry.details ?? ''}`.toLocaleLowerCase('pl-PL').includes(query))
+    .slice(0, 500)
+  return response.json({ entries })
 })
 
 app.get('/api/admin/settings', requireAdminAuthentication, requireAdminPermission('settings.view'), async (_request, response) => {
@@ -1801,13 +2098,126 @@ app.get('/api/admin/settings', requireAdminAuthentication, requireAdminPermissio
 })
 
 app.patch('/api/admin/settings', requireAdminAuthentication, requireAdminPermission('settings.manage'), adminMutationLimit, async (request, response) => {
-  const { registrationEnabled } = request.body ?? {}
-  if (typeof registrationEnabled !== 'boolean') return response.status(400).json({ error: 'Wybierz prawidłową wartość dostępności rejestracji.' })
+  const { registrationEnabled, publishingEnabled } = request.body ?? {}
+  if (typeof registrationEnabled !== 'boolean' || typeof publishingEnabled !== 'boolean') return response.status(400).json({ error: 'Ustaw dostępność rejestracji i publikowania.' })
   const settings = await updateStore((store) => {
     store.platformSettings.registrationEnabled = registrationEnabled
+    store.platformSettings.publishingEnabled = publishingEnabled
+    appendAdminAudit(store, request.adminUser, 'PATCH', '/api/admin/settings', `Rejestracja: ${registrationEnabled ? 'włączona' : 'wyłączona'}; publikowanie: ${publishingEnabled ? 'włączone' : 'wyłączone'}`)
     return store.platformSettings
   })
   return response.json({ settings })
+})
+
+app.get('/api/admin/content', requireAdminAuthentication, requireAdminPermission('content.view'), async (request, response) => {
+  const store = await readStore()
+  const search = typeof request.query.q === 'string' ? request.query.q.trim().toLocaleLowerCase('pl-PL') : ''
+  const status = request.query.status === 'hidden' ? 'hidden' : request.query.status === 'visible' ? 'visible' : 'all'
+  const requestedType = ['post', 'comment'].includes(request.query.type) ? request.query.type : 'all'
+  let posts
+  if (database) {
+    const { rows } = await database.query(
+      'SELECT id, author_id, data, created_at FROM youtopic_social_posts WHERE band_id IS NULL ORDER BY created_at DESC, id DESC LIMIT 1000',
+    )
+    posts = rows.map((row) => ({ id: String(row.id), authorId: row.author_id, data: row.data, comments: row.data.comments ?? [], createdAt: Number(row.created_at) }))
+  } else {
+    posts = store.socialPosts.filter((post) => !post.data.bandId).slice(0, 1000)
+  }
+  const usersById = new Map(store.users.map((user) => [user.id, user]))
+  const moderationRecordFor = (type, targetId, userId) => store.moderatedItems.find((item) =>
+    item.targetType === type && item.targetId === targetId && item.targetUserId === userId)
+  const items = []
+  for (const post of posts) {
+    const author = usersById.get(post.authorId)
+    const authorName = author ? [author.firstName, author.middleName, author.lastName, author.secondLastName].filter(Boolean).join(' ') : 'Konto usunięte'
+    const postTargetId = `post:${post.id}`
+    const postPreview = [post.data.topic, post.data.text, post.data.externalUrl].filter(Boolean).join(' · ') || (post.data.image || post.data.video ? 'Post z załącznikiem' : '')
+    const postModeration = moderationRecordFor('post', postTargetId, post.authorId)
+      ?? (post.data.image ? moderationRecordFor('photo', `photo:${post.id}`, post.authorId) : null)
+      ?? (post.data.video ? moderationRecordFor('video', `video:${post.id}`, post.authorId) : null)
+    items.push({
+      key: `post:${post.id}`,
+      targetType: 'post',
+      targetId: postTargetId,
+      targetUserId: post.authorId,
+      authorName,
+      contentPreview: postPreview.slice(0, 1000),
+      createdAt: post.createdAt ?? post.data.createdAt ?? 0,
+      isModerated: Boolean(postModeration),
+      moderationRecordId: postModeration?.reportId,
+      moderationReason: postModeration?.moderationReason ?? '',
+      reportCount: store.reports.filter((report) => report.targetId === postTargetId && report.status === 'pending').length,
+    })
+    for (const comment of post.comments) {
+      if (!comment?.authorId || comment.id === undefined) continue
+      const commentTargetId = `comment:${post.id}:${comment.id}`
+      const commentAuthor = usersById.get(comment.authorId)
+      const commentModeration = moderationRecordFor('comment', commentTargetId, comment.authorId)
+      items.push({
+        key: commentTargetId,
+        targetType: 'comment',
+        targetId: commentTargetId,
+        targetUserId: comment.authorId,
+        authorName: commentAuthor ? [commentAuthor.firstName, commentAuthor.middleName, commentAuthor.lastName, commentAuthor.secondLastName].filter(Boolean).join(' ') : 'Konto usunięte',
+        contentPreview: typeof comment.text === 'string' ? comment.text.slice(0, 1000) : 'Komentarz głosowy',
+        createdAt: Number(comment.createdAt ?? post.createdAt ?? 0),
+        isModerated: Boolean(commentModeration),
+        moderationRecordId: commentModeration?.reportId,
+        moderationReason: commentModeration?.moderationReason ?? '',
+        reportCount: store.reports.filter((report) => report.targetId === commentTargetId && report.status === 'pending').length,
+      })
+    }
+  }
+  const filtered = items
+    .filter((item) => requestedType === 'all' || item.targetType === requestedType)
+    .filter((item) => status === 'all' || (status === 'hidden' ? item.isModerated : !item.isModerated))
+    .filter((item) => !search || `${item.authorName} ${item.contentPreview} ${item.targetId}`.toLocaleLowerCase('pl-PL').includes(search))
+    .sort((first, second) => second.createdAt - first.createdAt)
+    .slice(0, 500)
+  response.set('Cache-Control', 'no-store')
+  return response.json({ items: filtered })
+})
+
+app.post('/api/admin/content/moderate', requireAdminAuthentication, requireAdminPermission('content.manage'), adminMutationLimit, async (request, response) => {
+  const { targetType, targetId, targetUserId, reason } = request.body ?? {}
+  if (!['post', 'comment'].includes(targetType) || typeof targetId !== 'string' || typeof targetUserId !== 'string') {
+    return response.status(400).json({ error: 'Nieprawidłowa treść do moderacji.' })
+  }
+  if (typeof reason !== 'string' || reason.trim().length < 5 || reason.trim().length > 500) {
+    return response.status(400).json({ error: 'Podaj uzasadnienie moderacji (od 5 do 500 znaków).' })
+  }
+  const match = targetType === 'post' ? /^post:(\d+)$/.exec(targetId) : /^comment:(\d+):(\d+)$/.exec(targetId)
+  if (!match) return response.status(400).json({ error: 'Nieprawidłowy identyfikator treści.' })
+  const [postId, commentId] = targetType === 'post' ? [match[1], ''] : [match[1], match[2]]
+  const result = await updateStore(async (store, client) => {
+    let post
+    if (database) {
+      const { rows } = await client.query('SELECT id, author_id, data FROM youtopic_social_posts WHERE id = $1 FOR UPDATE', [postId])
+      if (rows[0]) post = { id: String(rows[0].id), authorId: rows[0].author_id, data: rows[0].data, comments: rows[0].data.comments ?? [] }
+    } else {
+      post = store.socialPosts.find((item) => String(item.id) === postId)
+    }
+    if (!post) return { error: 'Nie znaleziono posta.', status: 404 }
+    const ownerId = targetType === 'post' ? post.authorId : post.comments.find((comment) => String(comment.id) === commentId)?.authorId
+    if (ownerId !== targetUserId) return { error: 'Treść nie należy do wskazanego użytkownika.', status: 409 }
+    if (store.moderatedItems.some((item) => item.targetType === targetType && item.targetId === targetId && item.targetUserId === targetUserId)) {
+      return { error: 'Ta treść jest już ukryta przez moderację.', status: 409 }
+    }
+    const now = Date.now()
+    store.moderatedItems.push({
+      reportId: `admin-content:${crypto.randomUUID()}`,
+      targetType,
+      targetId,
+      targetUserId,
+      moderationReason: reason.trim(),
+      moderatedBy: request.adminUser.id,
+      removedAt: now,
+    })
+    appendAdminAudit(store, request.adminUser, 'POST', '/api/admin/content/moderate', `${targetType} ${targetId}: ${reason.trim()}`)
+    return { ok: true }
+  })
+  if (result.error) return response.status(result.status).json({ error: result.error })
+  return response.json(result)
 })
 
 app.get('/api/admin/content/moderated', requireAdminAuthentication, requireAdminPermission('content.view'), async (_request, response) => {
@@ -1820,6 +2230,7 @@ app.get('/api/admin/content/moderated', requireAdminAuthentication, requireAdmin
       const author = usersById.get(item.targetUserId)
       return {
         ...item,
+        moderationReason: item.moderationReason ?? '',
         contentPreview: report?.contentPreview ?? '',
         contentUrl: report?.contentUrl ?? '',
         authorName: author ? [author.firstName, author.middleName, author.lastName, author.secondLastName].filter(Boolean).join(' ') : 'Konto usunięte',
@@ -1830,9 +2241,11 @@ app.get('/api/admin/content/moderated', requireAdminAuthentication, requireAdmin
 
 app.delete('/api/admin/content/moderated/:reportId', requireAdminAuthentication, requireAdminPermission('content.manage'), adminMutationLimit, async (request, response) => {
   const restored = await updateStore((store) => {
-    const existingLength = store.moderatedItems.length
-    store.moderatedItems = store.moderatedItems.filter((item) => item.reportId !== request.params.reportId)
-    return store.moderatedItems.length < existingLength
+    const item = store.moderatedItems.find((entry) => entry.reportId === request.params.reportId)
+    if (!item) return false
+    store.moderatedItems = store.moderatedItems.filter((entry) => entry.reportId !== request.params.reportId)
+    appendAdminAudit(store, request.adminUser, 'DELETE', `/api/admin/content/moderated/${request.params.reportId}`, `Przywrócono ${item.targetType} ${item.targetId}`)
+    return true
   })
   if (!restored) return response.status(404).json({ error: 'Nie znaleziono wpisu moderacji do przywrócenia.' })
   return response.json({ ok: true })
@@ -1840,6 +2253,9 @@ app.delete('/api/admin/content/moderated/:reportId', requireAdminAuthentication,
 
 app.get('/api/admin/users', requireAdminAuthentication, requireAdminPermission('users.view'), async (request, response) => {
   const store = await readStore()
+  const loginIpHashes = database
+    ? new Map((await database.query('SELECT user_id, last_ip_hash FROM youtopic_user_login_metadata')).rows.map((row) => [row.user_id, row.last_ip_hash]))
+    : new Map()
   const canViewPersonalData = request.adminUser.isSuperAdmin || permissionsForAdmin(request.adminUser).includes('users.personal_data.view')
   const activeUsers = store.users.map((user) => ({
     id: user.id,
@@ -1862,7 +2278,7 @@ app.get('/api/admin/users', requireAdminAuthentication, requireAdminPermission('
     blockedReason: user.blockedReason ?? '',
     reportCount: store.reports.filter((report) => report.targetUserId === user.id && report.status === 'pending').length,
     ipBlockedUntil: store.ipBlocks.find((block) => block.userId === user.id && block.expiresAt > Date.now())?.expiresAt ?? null,
-    canBlockIp: Boolean(user.lastIpHash),
+    canBlockIp: Boolean(loginIpHashes.get(user.id) || user.lastIpHash),
     isAdmin: store.admins.some((admin) => admin.email === user.email),
   }))
   const deletedUsers = store.deletedUsers.map((user) => ({
@@ -2009,12 +2425,15 @@ app.patch('/api/admin/users/:id/block', requireAdminAuthentication, requireAdmin
   if (blocked && typeof reason === 'string' && reason.length > 500) return response.status(400).json({ error: 'Powód blokady może mieć maksymalnie 500 znaków.' })
   if (typeof blockIp !== 'boolean') return response.status(400).json({ error: 'Nieprawidłowa opcja blokady IP.' })
   if (blocked && ![7, 30, 90].includes(durationDays)) return response.status(400).json({ error: 'Wybierz blokadę na 7 dni, 30 dni lub 3 miesiące.' })
-
-  const result = await updateStore((store) => {
+  const result = await updateStore(async (store, client) => {
     const user = store.users.find((item) => item.id === request.params.id)
     if (!user) return { error: 'Nie znaleziono konta.', status: 404 }
     if (store.admins.some((admin) => admin.email === user.email)) return { error: 'Nie można zmienić statusu konta administratora.', status: 409 }
-    if (blocked && blockIp && !user.lastIpHash) return { error: 'Brak zapisanego adresu IP tego użytkownika. Blokada IP będzie dostępna po jego kolejnym logowaniu.', status: 409 }
+    const loginIpHash = database
+      ? (await client.query('SELECT last_ip_hash FROM youtopic_user_login_metadata WHERE user_id = $1', [request.params.id])).rows[0]?.last_ip_hash
+      : ''
+    const userIpHash = loginIpHash || user.lastIpHash
+    if (blocked && blockIp && !userIpHash) return { error: 'Brak zapisanego adresu IP tego użytkownika. Blokada IP będzie dostępna po jego kolejnym logowaniu.', status: 409 }
     const now = Date.now()
     user.blockedAt = blocked ? now : null
     user.blockedUntil = blocked ? now + durationDays * 24 * 60 * 60 * 1000 : null
@@ -2024,14 +2443,30 @@ app.patch('/api/admin/users/:id/block', requireAdminAuthentication, requireAdmin
     if (blocked && blockIp) {
       store.ipBlocks.push({
         userId: user.id,
-        ipHash: user.lastIpHash,
+        ipHash: userIpHash,
         createdAt: now,
         expiresAt: user.blockedUntil,
         createdBy: request.adminUser.id,
       })
     }
     const ipBlock = store.ipBlocks.find((item) => item.userId === user.id)
+    appendAdminAudit(store, request.adminUser, 'PATCH', `/api/admin/users/${user.id}/block`, `${blocked ? 'Zablokowano' : 'Odblokowano'} konto ${defaultProfileNickname(user)}${blocked && blockIp ? ' oraz ostatni adres IP' : ''}${blocked && reason ? `; powód: ${reason.trim()}` : ''}`)
     return { ok: true, blockedUntil: user.blockedUntil, ipBlockedUntil: ipBlock?.expiresAt ?? null }
+  })
+  if (result.error) return response.status(result.status).json({ error: result.error })
+  return response.json(result)
+})
+
+app.post('/api/admin/users/:id/revoke-sessions', requireAdminAuthentication, requireAdminPermission('users.sessions.revoke'), adminMutationLimit, async (request, response) => {
+  const reason = typeof request.body?.reason === 'string' ? request.body.reason.trim() : ''
+  if (reason.length < 5 || reason.length > 500) return response.status(400).json({ error: 'Podaj uzasadnienie wylogowania (od 5 do 500 znaków).' })
+  const result = await updateStore((store) => {
+    const user = store.users.find((item) => item.id === request.params.id)
+    if (!user) return { error: 'Nie znaleziono aktywnego konta.', status: 404 }
+    if (store.admins.some((admin) => admin.email === user.email)) return { error: 'Nie można wylogować administratora z tego panelu.', status: 409 }
+    user.authVersion = (user.authVersion ?? 0) + 1
+    appendAdminAudit(store, request.adminUser, 'POST', `/api/admin/users/${user.id}/revoke-sessions`, `Wylogowano użytkownika ${defaultProfileNickname(user)}. Powód: ${reason}`)
+    return { ok: true }
   })
   if (result.error) return response.status(result.status).json({ error: result.error })
   return response.json(result)
@@ -2046,6 +2481,7 @@ app.patch('/api/admin/users/:id/verification', requireAdminAuthentication, requi
     if (store.admins.some((admin) => admin.email === user.email)) return { error: 'Konta administratora nie można oznaczyć jako zweryfikowanego profilu.', status: 409 }
     user.profileVerified = verified
     user.profileVerifiedAt = verified ? Date.now() : null
+    appendAdminAudit(store, request.adminUser, 'PATCH', `/api/admin/users/${user.id}/verification`, `${verified ? 'Zweryfikowano' : 'Cofnięto weryfikację'} profilu ${defaultProfileNickname(user)}`)
     return { ok: true }
   })
   if (result.error) return response.status(result.status).json({ error: result.error })
@@ -2083,10 +2519,11 @@ app.get('/api/admin/users/:id/reports', requireAdminAuthentication, requireAdmin
 })
 
 app.delete('/api/admin/users/:id', requireAdminAuthentication, requireAdminPermission('users.delete'), adminMutationLimit, async (request, response) => {
-  const result = await updateStore((store) => {
+  const result = await updateStore(async (store, client) => {
     const user = store.users.find((item) => item.id === request.params.id)
     if (!user) return { error: 'Nie znaleziono aktywnego konta.', status: 404 }
     if (store.admins.some((admin) => admin.email === user.email)) return { error: 'Konta administratora nie można usunąć z listy użytkowników.', status: 409 }
+    if (database) await client.query('DELETE FROM youtopic_user_login_metadata WHERE user_id = $1', [user.id])
     store.users = store.users.filter((item) => item.id !== user.id)
     store.deletedUsers.unshift({
       id: user.id,
@@ -2181,6 +2618,7 @@ app.post('/api/reports', requireAuthentication, authRateLimit, async (request, r
       const message = store.socialChatMessages.find((item) => item.id === messageId && item.authorId === targetUserId)
       if (!message) return { error: 'Nie znaleziono zgłaszanej wiadomości.', status: 404 }
       snapshot = [message.text, snapshot].filter(Boolean).join('\n\n').slice(0, 1000)
+      mediaId = message.mediaId ?? ''
     }
     if (contentUrl && targetType !== 'profile' && (!mediaId || !mediaMatch || mediaMatch[1] !== mediaId)) return { error: 'Nie można powiązać załącznika ze zgłaszaną treścią.', status: 400 }
     const report = {
@@ -2206,6 +2644,9 @@ app.post('/api/reports', requireAuthentication, authRateLimit, async (request, r
 app.get('/api/admin/reports', requireAdminAuthentication, requireAdminPermission('reports.view'), async (_request, response) => {
   const store = await readStore()
   const usersById = new Map(store.users.map((user) => [user.id, user]))
+  const reportAssignees = store.admins
+    .filter((admin) => admin.isSuperAdmin || permissionsForAdmin(admin).includes('reports.manage'))
+    .map(({ id, name, rank }) => ({ id, name, rank }))
   const reports = store.reports
     .slice()
     .sort((first, second) => second.createdAt - first.createdAt)
@@ -2213,6 +2654,7 @@ app.get('/api/admin/reports', requireAdminAuthentication, requireAdminPermission
       const reporter = usersById.get(report.reporterId)
       const target = usersById.get(report.targetUserId)
       const decidingAdmin = store.admins.find((admin) => admin.id === report.decidedBy)
+      const assignee = store.admins.find((admin) => admin.id === report.assigneeId)
       return {
         id: report.id,
         targetType: report.targetType || 'profile',
@@ -2224,6 +2666,10 @@ app.get('/api/admin/reports', requireAdminAuthentication, requireAdminPermission
         reason: report.reason,
         createdAt: report.createdAt,
         status: report.status === 'pending' ? 'pending' : 'resolved',
+        priority: ['low', 'normal', 'high', 'urgent'].includes(report.priority) ? report.priority : 'normal',
+        assigneeId: report.assigneeId || null,
+        assignee: assignee ? { id: assignee.id, name: assignee.name, rank: assignee.rank } : null,
+        internalNotes: permissionsForAdmin(_request.adminUser).includes('reports.manage') && Array.isArray(report.internalNotes) ? report.internalNotes : [],
         decision: report.decision || null,
         decisionNote: report.decisionNote || '',
         decidedAt: report.decidedAt || null,
@@ -2240,7 +2686,43 @@ app.get('/api/admin/reports', requireAdminAuthentication, requireAdminPermission
       }
     })
   response.set('Cache-Control', 'no-store')
-  return response.json({ reports })
+  return response.json({ reports, reportAssignees })
+})
+
+app.patch('/api/admin/reports/:id/triage', requireAdminAuthentication, requireAdminPermission('reports.manage'), adminMutationLimit, async (request, response) => {
+  const { priority, assigneeId, internalNote } = request.body ?? {}
+  if (priority !== undefined && !['low', 'normal', 'high', 'urgent'].includes(priority)) return response.status(400).json({ error: 'Wybierz prawidłowy priorytet zgłoszenia.' })
+  if (assigneeId !== undefined && typeof assigneeId !== 'string') return response.status(400).json({ error: 'Nieprawidłowe przypisanie moderatora.' })
+  if (internalNote !== undefined && (typeof internalNote !== 'string' || !internalNote.trim() || internalNote.trim().length > 1000)) return response.status(400).json({ error: 'Notatka wewnętrzna musi mieć od 1 do 1000 znaków.' })
+
+  const result = await updateStore((store) => {
+    const report = store.reports.find((item) => item.id === request.params.id)
+    if (!report) return { error: 'Nie znaleziono zgłoszenia.', status: 404 }
+    if (report.status !== 'pending') return { error: 'Nie można zmieniać organizacji rozpatrzonego zgłoszenia.', status: 409 }
+    if (assigneeId) {
+      const assignee = store.admins.find((admin) => admin.id === assigneeId)
+      if (!assignee || (!assignee.isSuperAdmin && !permissionsForAdmin(assignee).includes('reports.manage'))) {
+        return { error: 'Wybrany administrator nie ma uprawnień do obsługi zgłoszeń.', status: 400 }
+      }
+    }
+    if (priority !== undefined) report.priority = priority
+    if (assigneeId !== undefined) report.assigneeId = assigneeId || null
+    if (internalNote !== undefined) {
+      if (!Array.isArray(report.internalNotes)) report.internalNotes = []
+      report.internalNotes.push({
+        id: crypto.randomUUID(),
+        adminId: request.adminUser.id,
+        adminName: request.adminUser.name,
+        note: internalNote.trim(),
+        createdAt: Date.now(),
+      })
+      report.internalNotes = report.internalNotes.slice(-100)
+    }
+    appendAdminAudit(store, request.adminUser, 'PATCH', `/api/admin/reports/${report.id}/triage`, `Zaktualizowano obsługę zgłoszenia${priority !== undefined ? `; priorytet: ${priority}` : ''}${assigneeId !== undefined ? `; przypisanie: ${assigneeId || 'brak'}` : ''}${internalNote !== undefined ? '; dodano notatkę wewnętrzną' : ''}`)
+    return { ok: true }
+  })
+  if (result.error) return response.status(result.status).json({ error: result.error })
+  return response.json(result)
 })
 
 app.patch('/api/admin/reports/:id/decision', requireAdminAuthentication, requireAdminPermission('reports.manage'), adminMutationLimit, async (request, response) => {
@@ -2298,6 +2780,7 @@ app.patch('/api/admin/reports/:id/decision', requireAdminAuthentication, require
         createdAt: now,
       })
     }
+    appendAdminAudit(store, request.adminUser, 'PATCH', `/api/admin/reports/${report.id}/decision`, `Decyzja: ${decision}; treść: ${report.targetType}; użytkownik: ${target?.id ?? report.targetUserId}${note.trim() ? `; uzasadnienie: ${note.trim()}` : ''}`)
     if (decision === 'remove_content') {
       store.moderatedItems.push({
         reportId: report.id,
@@ -2333,11 +2816,17 @@ app.get('/api/moderation/removed-content', requireAuthentication, async (request
   })
 })
 
+function publicSupportTicket(ticket) {
+  const { id, userId, subject, category, status, messages, createdAt, updatedAt } = ticket
+  return { id, userId, subject, category, status, messages, createdAt, updatedAt }
+}
+
 app.get('/api/support/tickets', requireAuthentication, async (request, response) => {
   const store = request.authStore
   const tickets = store.supportTickets
     .filter((ticket) => ticket.userId === request.authUser.id)
     .sort((first, second) => second.updatedAt - first.updatedAt)
+    .map(publicSupportTicket)
   return response.json({ tickets })
 })
 
@@ -2359,6 +2848,9 @@ app.post('/api/support/tickets', requireAuthentication, supportCreationLimit, as
     subject: subject.trim(),
     category,
     status: 'open',
+    priority: 'normal',
+    assigneeId: null,
+    internalNotes: [],
     messages: [{ id: crypto.randomUUID(), authorType: 'user', authorName: defaultProfileNickname(request.authUser), message: message.trim(), createdAt: now }],
     createdAt: now,
     updatedAt: now,
@@ -2367,9 +2859,38 @@ app.post('/api/support/tickets', requireAuthentication, supportCreationLimit, as
   return response.status(201).json({ ticket })
 })
 
+app.post('/api/support/tickets/:id/replies', requireAuthentication, supportReplyLimit, async (request, response) => {
+  const message = request.body?.message
+  if (typeof message !== 'string' || !message.trim() || message.trim().length > 5000) {
+    return response.status(400).json({ error: 'Wiadomość musi mieć od 1 do 5000 znaków.' })
+  }
+  const result = await updateStore((store) => {
+    const ticket = store.supportTickets.find((item) => item.id === request.params.id && item.userId === request.authUser.id)
+    if (!ticket) return { error: 'Nie znaleziono sprawy pomocy.', status: 404 }
+    if (ticket.status === 'resolved' || ticket.status === 'closed') {
+      return { error: 'Ta sprawa jest już zamknięta. Utwórz nowe zgłoszenie, aby skontaktować się ponownie.', status: 409 }
+    }
+    ticket.messages.push({
+      id: crypto.randomUUID(),
+      authorType: 'user',
+      authorName: defaultProfileNickname(request.authUser),
+      message: message.trim(),
+      createdAt: Date.now(),
+    })
+    ticket.status = 'open'
+    ticket.updatedAt = Date.now()
+    return { ticket: publicSupportTicket(ticket) }
+  })
+  if (result.error) return response.status(result.status).json({ error: result.error })
+  return response.json(result)
+})
+
 app.get('/api/admin/support/tickets', requireAdminAuthentication, requireAdminPermission('support.view'), async (_request, response) => {
   const store = await readStore()
   const usersById = new Map(store.users.map((user) => [user.id, user]))
+  const supportAssignees = store.admins
+    .filter((admin) => admin.isSuperAdmin || permissionsForAdmin(admin).includes('support.manage'))
+    .map((admin) => ({ id: admin.id, name: admin.name, rank: admin.isSuperAdmin ? 'Super Administrator' : admin.rank }))
   const tickets = store.supportTickets
     .slice()
     .sort((first, second) => second.updatedAt - first.updatedAt)
@@ -2377,6 +2898,8 @@ app.get('/api/admin/support/tickets', requireAdminAuthentication, requireAdminPe
       const user = usersById.get(ticket.userId)
       return {
         ...ticket,
+        internalNotes: Array.isArray(ticket.internalNotes) ? ticket.internalNotes : [],
+        assignee: supportAssignees.find((admin) => admin.id === ticket.assigneeId) ?? null,
         user: user ? {
           id: user.id,
           name: [user.firstName, user.middleName, user.lastName, user.secondLastName].filter(Boolean).join(' '),
@@ -2384,37 +2907,71 @@ app.get('/api/admin/support/tickets', requireAdminAuthentication, requireAdminPe
         } : { id: ticket.userId, name: 'Konto usunięte', nickname: '' },
       }
     })
-  return response.json({ tickets })
+  return response.json({ tickets, supportAssignees })
 })
 
 app.patch('/api/admin/support/tickets/:id', requireAdminAuthentication, requireAdminPermission('support.manage'), adminMutationLimit, async (request, response) => {
-  const { status, reply } = request.body ?? {}
-  if (status !== undefined && !['open', 'in_progress', 'resolved'].includes(status)) {
+  const { status, reply, priority, assigneeId, internalNote } = request.body ?? {}
+  if (status !== undefined && !['open', 'in_progress', 'resolved', 'closed'].includes(status)) {
     return response.status(400).json({ error: 'Wybierz prawidłowy status sprawy.' })
   }
+  if (priority !== undefined && !['low', 'normal', 'high', 'urgent'].includes(priority)) return response.status(400).json({ error: 'Wybierz prawidłowy priorytet sprawy.' })
+  if (assigneeId !== undefined && typeof assigneeId !== 'string') return response.status(400).json({ error: 'Nieprawidłowy moderator sprawy.' })
   if (reply !== undefined && (typeof reply !== 'string' || !reply.trim() || reply.trim().length > 5000)) {
     return response.status(400).json({ error: 'Odpowiedź musi mieć od 1 do 5000 znaków.' })
   }
-  if (status === undefined && reply === undefined) return response.status(400).json({ error: 'Podaj odpowiedź lub nowy status sprawy.' })
+  if (internalNote !== undefined && (typeof internalNote !== 'string' || !internalNote.trim() || internalNote.trim().length > 1000)) return response.status(400).json({ error: 'Notatka wewnętrzna musi mieć od 1 do 1000 znaków.' })
+  if ([status, reply, priority, assigneeId, internalNote].every((value) => value === undefined)) return response.status(400).json({ error: 'Podaj zmianę sprawy.' })
   const result = await updateStore((store) => {
     const ticket = store.supportTickets.find((item) => item.id === request.params.id)
     if (!ticket) return null
+    if (assigneeId) {
+      const assignee = store.admins.find((admin) => admin.id === assigneeId)
+      if (!assignee || (!assignee.isSuperAdmin && !permissionsForAdmin(assignee).includes('support.manage'))) {
+        return { error: 'Wybrany administrator nie ma uprawnienia do obsługi spraw.', status: 409 }
+      }
+    }
+    const nextStatus = status ?? ticket.status
+    if (reply && (nextStatus === 'resolved' || nextStatus === 'closed')) {
+      return { error: 'Nie można odpowiedzieć w zamkniętej sprawie. Najpierw zmień jej status na otwarty lub w trakcie.', status: 409 }
+    }
     if (status) ticket.status = status
+    if (priority) ticket.priority = priority
+    if (assigneeId !== undefined) ticket.assigneeId = assigneeId || null
+    if (internalNote) {
+      ticket.internalNotes ??= []
+      ticket.internalNotes.push({ id: crypto.randomUUID(), adminId: request.adminUser.id, adminName: request.adminUser.name, note: internalNote.trim(), createdAt: Date.now() })
+      ticket.internalNotes = ticket.internalNotes.slice(-100)
+    }
     if (reply) {
+      const now = Date.now()
       ticket.messages.push({
         id: crypto.randomUUID(),
         authorType: 'admin',
         authorName: request.adminUser.name,
         message: reply.trim(),
-        createdAt: Date.now(),
+        createdAt: now,
       })
       if (ticket.status === 'open') ticket.status = 'in_progress'
+      store.socialNotifications.unshift({
+        id: crypto.randomUUID(),
+        userId: ticket.userId,
+        actorId: request.adminUser.id,
+        type: 'support_reply',
+        message: `odpowiedział na Twoją sprawę „${ticket.subject}”`,
+        ticketId: ticket.id,
+        createdAt: now,
+        readAt: null,
+      })
+      store.socialNotifications = store.socialNotifications.slice(0, 5000)
     }
     ticket.updatedAt = Date.now()
-    return ticket
+    appendAdminAudit(store, request.adminUser, 'PATCH', `/api/admin/support/tickets/${ticket.id}`, `Zaktualizowano sprawę ${ticket.subject}${priority ? `; priorytet: ${priority}` : ''}${assigneeId !== undefined ? `; przypisanie: ${assigneeId || 'brak'}` : ''}${internalNote ? '; dodano notatkę wewnętrzną' : ''}${status ? `; status: ${status}` : ''}${reply ? '; wysłano odpowiedź' : ''}`)
+    return { ticket }
   })
   if (!result) return response.status(404).json({ error: 'Nie znaleziono sprawy pomocy.' })
-  return response.json({ ticket: result })
+  if (result.error) return response.status(result.status).json({ error: result.error })
+  return response.json(result)
 })
 
 app.get('/api/admin/announcements', requireAdminAuthentication, requireAdminPermission('announcements.view'), async (_request, response) => {
@@ -2451,7 +3008,10 @@ app.post('/api/admin/announcements', requireAdminAuthentication, requireAdminPer
     startsAt,
     endsAt: endsAt ?? null,
   }
-  await updateStore((store) => { store.announcements.unshift(announcement) })
+  await updateStore((store) => {
+    store.announcements.unshift(announcement)
+    appendAdminAudit(store, request.adminUser, 'POST', '/api/admin/announcements', `Opublikowano komunikat: ${announcement.title}`)
+  })
   return response.status(201).json({ announcement })
 })
 
@@ -2460,6 +3020,7 @@ app.delete('/api/admin/announcements/:id', requireAdminAuthentication, requireAd
     const announcement = store.announcements.find((item) => item.id === request.params.id)
     if (!announcement) return false
     announcement.active = false
+    appendAdminAudit(store, request.adminUser, 'DELETE', `/api/admin/announcements/${announcement.id}`, `Wyłączono komunikat: ${announcement.title}`)
     return true
   })
   if (!result) return response.status(404).json({ error: 'Nie znaleziono komunikatu.' })
@@ -2567,7 +3128,7 @@ app.delete('/api/admin/admins/:id', requireAdminAuthentication, requireAdminPerm
 })
 
 app.post('/api/auth/register', authRateLimit, async (request, response) => {
-  if ((await readStore()).platformSettings.registrationEnabled === false) {
+  if (request.authStore.platformSettings.registrationEnabled === false) {
     return response.status(403).json({ error: 'Rejestracja nowych kont jest obecnie wstrzymana. Spróbuj ponownie później.' })
   }
   const { firstName, lastName, gender, birthDate, email, phone, password, confirmPassword } = request.body ?? {}
@@ -2605,13 +3166,10 @@ app.post('/api/auth/register', authRateLimit, async (request, response) => {
     return true
   })
   if (!inserted) return response.status(409).json({ error: 'Konto z tym adresem e-mail lub numerem telefonu już istnieje.' })
-  try {
-    await sendVerificationEmail(user, emailToken)
-  } catch {
-    await updateStore((store) => { store.users = store.users.filter((item) => item.id !== user.id) })
-    return response.status(503).json({ error: 'Nie udało się wysłać e-maila. Sprawdź konfigurację SMTP i spróbuj ponownie.' })
-  }
-  return response.status(201).json({ message: 'Wysłaliśmy link potwierdzający na podany adres e-mail.' })
+  sendVerificationEmail(user, emailToken).catch((error) => {
+    console.error('Registration verification email failed:', error)
+  })
+  return response.status(201).json({ message: 'Konto utworzone. Wysyłamy link potwierdzający na podany adres e-mail. Jeśli nie dotrze, użyj opcji wysłania go ponownie.' })
 })
 
 app.post('/api/auth/verify-email', authRateLimit, async (request, response) => {
@@ -2743,17 +3301,13 @@ app.post('/api/auth/login/email', authRateLimit, async (request, response) => {
   const password = request.body?.password
   const rememberMe = request.body?.rememberMe === true
   if (typeof password !== 'string' || password.length < 7 || password.length > 256) return response.status(400).json({ error: 'Hasło musi mieć od 7 do 256 znaków.' })
-  const user = (await readStore()).users.find((item) => item.email === email)
+  const user = request.authStore.users.find((item) => item.email === email)
   if (!user || !(await verifyPassword(password, user.passwordHash))) return response.status(401).json({ error: 'Nieprawidłowy e-mail lub hasło.' })
   if (!user.emailVerified) return response.status(403).json({ error: 'Najpierw potwierdź adres e-mail z wiadomości.' })
   if (isUserBlocked(user)) return response.status(403).json({ error: 'Dostęp do tego konta został czasowo ograniczony. Skontaktuj się z administracją YouTopic.' })
-  const loggedInUser = await updateStore((store) => {
-    const savedUser = store.users.find((item) => item.id === user.id)
-    if (!savedUser || isUserBlocked(savedUser)) return null
-    savedUser.lastIpHash = hashIp(request.ip)
-    return savedUser
-  })
-  if (!loggedInUser) return response.status(403).json({ error: 'Dostęp do tego konta został czasowo ograniczony. Skontaktuj się z administracją YouTopic.' })
+  const ipHash = hashIp(request.ip)
+  if (!(await recordSuccessfulLogin(user.id, ipHash))) return response.status(403).json({ error: 'Dostęp do tego konta został czasowo ograniczony. Skontaktuj się z administracją YouTopic.' })
+  const loggedInUser = { ...user, lastIpHash: ipHash }
   setSession(response, loggedInUser, rememberMe)
   response.clearCookie(trustedDeviceCookie, deviceCookieOptions(0))
   response.clearCookie(pendingDeviceCookie, deviceCookieOptions(0))
