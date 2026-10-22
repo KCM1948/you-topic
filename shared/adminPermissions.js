@@ -9,6 +9,8 @@ export const adminPermissionCatalog = [
   { id: 'settings.manage', label: 'Zarządzanie ustawieniami platformy' },
   { id: 'content.view', label: 'Przeglądanie rejestru moderacji treści' },
   { id: 'content.manage', label: 'Przywracanie treści z rejestru moderacji' },
+  { id: 'gallery.view', label: 'Przeglądanie galerii użytkowników' },
+  { id: 'gallery.photos.delete', label: 'Usuwanie zdjęć naruszających regulamin' },
   { id: 'users.view', label: 'Przeglądanie użytkowników' },
   { id: 'users.personal_data.view', label: 'Wyświetlanie danych osobowych (miejscowość, data urodzenia, telefony)' },
   { id: 'users.block', label: 'Blokowanie i odblokowywanie kont' },

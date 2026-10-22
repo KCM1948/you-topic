@@ -9,6 +9,8 @@ export type AdminPermission =
   | 'settings.manage'
   | 'content.view'
   | 'content.manage'
+  | 'gallery.view'
+  | 'gallery.photos.delete'
   | 'users.view'
   | 'users.personal_data.view'
   | 'users.block'

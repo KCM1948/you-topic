@@ -2,6 +2,7 @@ import { Fragment, useEffect, useMemo, useRef, useState, type ChangeEvent, type 
 import {
   Bookmark,
   BadgeCheck,
+  BellOff,
   ArrowUp,
   Check,
   ChevronDown,
@@ -18,8 +19,10 @@ import {
   LifeBuoy,
   LockKeyhole,
   LogOut,
+  Maximize2,
   MessageCircle,
   Mic,
+  Minimize2,
   MoreHorizontal,
   Pause,
   Pin,
@@ -56,6 +59,7 @@ type Person = {
   coverImage?: string
   socialLinks?: Partial<Record<SocialPlatform, string>>
   profileVisibility?: ProfileVisibilitySettings
+  socialPrivacy?: SocialPrivacy
   gender?: Gender
   online?: boolean
   crewMembers: number
@@ -67,6 +71,7 @@ type Gender = 'female' | 'male' | 'other' | 'undisclosed'
 type SocialPlatform = 'Instagram' | 'TikTok' | 'YouTube' | 'Facebook' | 'X' | 'LinkedIn' | 'Twitch'
 type SocialProfileLink = { id: number; platform: SocialPlatform; url: string }
 type ProfileAudience = 'public' | 'crew' | 'private'
+type SocialPrivacy = { profileAudience: ProfileAudience; crewInviteAudience: 'everyone' | 'nobody' }
 type ProfileVisibilitySettings = {
   location: ProfileAudience
   bio: ProfileAudience
@@ -90,6 +95,7 @@ const defaultProfileVisibility: ProfileVisibilitySettings = {
 
 type Post = {
   id: number
+  createdAt?: number
   serverBacked?: boolean
   author: Person
   time: string
@@ -110,6 +116,23 @@ type Post = {
   pinnedAt?: number
   sharedFrom?: { author: Person; topic: string; postId: number }
   profileTarget?: Person
+}
+
+type GalleryPhoto = {
+  id: string
+  url: string
+  caption: string
+  createdAt: number
+  sourcePostId?: string
+  mediaId?: string
+  albumId?: string
+}
+
+type GalleryAlbum = {
+  id: string
+  name: string
+  createdAt: number
+  photos: GalleryPhoto[]
 }
 
 type PostComment = {
@@ -136,12 +159,16 @@ type ReportNotification = {
 type SocialNotification = {
   id: string
   actor: Person | null
-  type: 'like' | 'boost' | 'comment' | 'comment_like' | 'crew_invitation' | 'crew_accepted'
+  type: 'like' | 'boost' | 'comment' | 'comment_like' | 'crew_invitation' | 'crew_accepted' | 'chat_message'
   message: string
   postId?: string
+  chatHandle?: string
+  crewInvitationId?: string
   createdAt: number
   readAt: number | null
 }
+
+type PostCursor = { before: number; beforeId: number }
 
 type ModeratedItem = {
   targetType: string
@@ -152,6 +179,20 @@ type ModeratedItem = {
 function reportTypeName(targetType: string) {
   return ({ profile: 'profil', post: 'post', photo: 'zdjęcie', video: 'wideo', comment: 'komentarz', message: 'wiadomość' } as Record<string, string>)[targetType] ?? 'treść'
 }
+
+type ReportReasonCategory = 'terms_violation' | 'harassment' | 'hate' | 'violence' | 'spam' | 'privacy' | 'impersonation' | 'sexual_content' | 'other'
+
+const reportCategoryOptions: Array<{ id: ReportReasonCategory; label: string }> = [
+  { id: 'terms_violation', label: 'Narusza regulamin' },
+  { id: 'harassment', label: 'Nękanie' },
+  { id: 'hate', label: 'Mowa nienawiści' },
+  { id: 'violence', label: 'Przemoc / groźby' },
+  { id: 'spam', label: 'Spam / oszustwo' },
+  { id: 'privacy', label: 'Naruszenie prywatności' },
+  { id: 'impersonation', label: 'Podszywanie się' },
+  { id: 'sexual_content', label: 'Treści seksualne' },
+  { id: 'other', label: 'Inne' },
+]
 
 type Announcement = {
   id: string
@@ -185,7 +226,6 @@ const storageKeys = {
   bandStories: 'youtopic-band-stories',
   personalStories: 'youtopic-personal-stories',
   users: 'youtopic-users',
-  feedPosts: 'youtopic-feed-posts',
   followedTopics: (handle: string) => `youtopic-followed-topics-${handle}`,
   dismissedAnnouncements: 'youtopic-dismissed-announcements',
 }
@@ -215,6 +255,30 @@ type ChatMessage = {
   recipientHandle?: string
   text: string
   time: string
+  createdAt: number
+}
+
+const phoneDialCodes = [
+  { country: 'PL', dialCode: '+48', label: 'Polska (+48)' },
+  { country: 'GB', dialCode: '+44', label: 'Wielka Brytania (+44)' },
+  { country: 'DE', dialCode: '+49', label: 'Niemcy (+49)' },
+  { country: 'UA', dialCode: '+380', label: 'Ukraina (+380)' },
+  { country: 'CZ', dialCode: '+420', label: 'Czechy (+420)' },
+  { country: 'SK', dialCode: '+421', label: 'Słowacja (+421)' },
+  { country: 'LT', dialCode: '+370', label: 'Litwa (+370)' },
+  { country: 'FR', dialCode: '+33', label: 'Francja (+33)' },
+  { country: 'ES', dialCode: '+34', label: 'Hiszpania (+34)' },
+  { country: 'IT', dialCode: '+39', label: 'Włochy (+39)' },
+  { country: 'NL', dialCode: '+31', label: 'Holandia (+31)' },
+  { country: 'SE', dialCode: '+46', label: 'Szwecja (+46)' },
+  { country: 'NO', dialCode: '+47', label: 'Norwegia (+47)' },
+  { country: 'US', dialCode: '+1', label: 'Stany Zjednoczone (+1)' },
+  { country: 'CA', dialCode: '+1', label: 'Kanada (+1)' },
+]
+
+function formatPostTime(createdAt?: number) {
+  if (!createdAt || !Number.isFinite(createdAt)) return 'Data niedostępna'
+  return new Intl.DateTimeFormat('pl-PL', { dateStyle: 'short', timeStyle: 'short' }).format(createdAt)
 }
 
 type CrewInvitation = {
@@ -251,64 +315,11 @@ type SupportTicket = {
 }
 
 const people: Person[] = [
-  { name: 'Olek Wiśniewski', handle: 'olek.w', avatar: 'https://images.unsplash.com/photo-1500648767791-00dcc994a43e?w=100&h=100&fit=crop&crop=faces', gender: 'male', online: true, crewMembers: 214, crewSize: 75 },
-  { name: 'Zosia Kowalska', handle: 'zosia.k', avatar: 'https://images.unsplash.com/photo-1544005313-94ddf0286df2?w=100&h=100&fit=crop&crop=faces', gender: 'female', online: true, crewMembers: 186, crewSize: 93 },
-  { name: 'Michał Zieliński', handle: 'michal.z', avatar: 'https://images.unsplash.com/photo-1506794778202-cad84cf45f1d?w=100&h=100&fit=crop&crop=faces', gender: 'male', crewMembers: 64, crewSize: 51 },
-  { name: 'Lena Wójcik', handle: 'lena.w', avatar: 'https://images.unsplash.com/photo-1531123897727-8f129e1688ce?w=100&h=100&fit=crop&crop=faces', gender: 'female', online: true, crewMembers: 98, crewSize: 112 },
-  { name: 'Ewa Kaczmarek', handle: 'ewa.k', avatar: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=100&h=100&fit=crop&crop=faces', gender: 'female', crewMembers: 123, crewSize: 87 },
-]
-
-const initialPosts: Post[] = [
-  {
-    id: 1,
-    author: people[0],
-    time: '18 min temu',
-    topic: 'MIASTO I PODRÓŻE',
-    text: 'Poranny spacer po Gdańsku i nagle wszystko zwalnia. Chyba właśnie za to najbardziej lubię to miasto. 🌊',
-    image: 'https://images.unsplash.com/photo-1502602898657-3e91760cbb34?w=1200&h=780&fit=crop',
-    likes: 38,
-    comments: ['Ale klimat! Muszę tam wrócić.', 'To zdjęcie pachnie wolnym weekendem.'],
-    boosts: 4,
-    liked: false,
-    saved: false,
-  },
-  {
-    id: 2,
-    author: people[1],
-    time: '1 godz. temu',
-    topic: 'KUCHNIA',
-    text: 'Testuję przepis na focaccię, który dostałam od babci. Werdykt: połowa zniknęła, zanim zdążyła ostygnąć. Kto chce przepis? 🍅',
-    image: 'https://images.unsplash.com/photo-1573384666979-2b1e160d2d08?w=1200&h=780&fit=crop',
-    likes: 64,
-    comments: ['Ja! Koniecznie wrzuć proporcje 🙌'],
-    boosts: 9,
-    liked: true,
-    saved: false,
-  },
-  {
-    id: 3,
-    author: people[2],
-    time: '3 godz. temu',
-    topic: 'POMYSŁY',
-    text: 'Mała rzecz, która poprawiła mi ten tydzień: zostawianie telefonu w domu na krótkie spacery. Głowa od razu robi się większa.',
-    likes: 21,
-    comments: [],
-    boosts: 2,
-    liked: false,
-    saved: true,
-  },
-  {
-    id: 4,
-    author: people[4],
-    time: '4 godz. temu',
-    topic: 'POMYSŁY',
-    text: 'Zrobiłam dziś miejsce na mały projekt, który odkładałam od miesięcy. Czasem wystarczy zacząć od jednej strony notesu.',
-    likes: 17,
-    comments: ['Trzymam kciuki za ten projekt!'],
-    boosts: 3,
-    liked: false,
-    saved: false,
-  },
+  { name: 'Olek Wiśniewski', handle: 'olek.w', avatar: 'https://images.unsplash.com/photo-1500648767791-00dcc994a43e?w=100&h=100&fit=crop&crop=faces', gender: 'male', online: true, crewMembers: 0, crewSize: 0 },
+  { name: 'Zosia Kowalska', handle: 'zosia.k', avatar: 'https://images.unsplash.com/photo-1544005313-94ddf0286df2?w=100&h=100&fit=crop&crop=faces', gender: 'female', online: true, crewMembers: 0, crewSize: 0 },
+  { name: 'Michał Zieliński', handle: 'michal.z', avatar: 'https://images.unsplash.com/photo-1506794778202-cad84cf45f1d?w=100&h=100&fit=crop&crop=faces', gender: 'male', crewMembers: 0, crewSize: 0 },
+  { name: 'Lena Wójcik', handle: 'lena.w', avatar: 'https://images.unsplash.com/photo-1531123897727-8f129e1688ce?w=100&h=100&fit=crop&crop=faces', gender: 'female', online: true, crewMembers: 0, crewSize: 0 },
+  { name: 'Ewa Kaczmarek', handle: 'ewa.k', avatar: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=100&h=100&fit=crop&crop=faces', gender: 'female', crewMembers: 0, crewSize: 0 },
 ]
 
 function crewPairKey(firstHandle: string, secondHandle: string) {
@@ -431,7 +442,15 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
   const [homeTab, setHomeTab] = useState<'board' | 'chat' | 'band'>('board')
   const [feedMode, setFeedMode] = useState<'for-you' | 'following'>(() => loadStored<string>(`youtopic-feed-mode-${currentUser.handle}`, 'for-you') === 'following' ? 'following' : 'for-you')
   const [selectedTopic, setSelectedTopic] = useState('')
-  const [posts, setPosts] = useState(() => loadStored<Post[]>(storageKeys.feedPosts, initialPosts))
+  const [posts, setPosts] = useState<Post[]>([])
+  const [postsLoading, setPostsLoading] = useState(true)
+  const [postsError, setPostsError] = useState('')
+  const [postsRetryKey, setPostsRetryKey] = useState(0)
+  const [postsCursor, setPostsCursor] = useState<PostCursor | null>(null)
+  const [hasMorePosts, setHasMorePosts] = useState(false)
+  const [loadingMorePosts, setLoadingMorePosts] = useState(false)
+  const [postsPageError, setPostsPageError] = useState('')
+  const [pendingPostNavigationId, setPendingPostNavigationId] = useState<number | null>(null)
   const [allUsers, setAllUsers] = useState(() => mergePeople(people, loadStored<Person[]>(storageKeys.users, []), [currentUser]))
   const [crewLinks, setCrewLinks] = useState<CrewLink[]>([])
   const [bands, setBands] = useState<Band[]>([])
@@ -468,7 +487,18 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
   const [platformUsers, setPlatformUsers] = useState<Person[]>([currentUser])
   const [userSearchResults, setUserSearchResults] = useState<Person[]>([])
   const [profile, setProfile] = useState<Person>(currentUser)
+  const [profileTab, setProfileTab] = useState<'posts' | 'gallery'>('posts')
   const [profileBoostTarget, setProfileBoostTarget] = useState<Person | null>(null)
+  const [reportDraft, setReportDraft] = useState<{
+    targetType: 'profile' | 'post' | 'photo' | 'video' | 'comment' | 'message'
+    targetId: string
+    targetUserId: string
+    targetName: string
+    contentPreview: string
+    contentUrl: string
+    reasonCategory: ReportReasonCategory
+    reason: string
+  } | null>(null)
   const [notice, setNotice] = useState('')
   const [announcements, setAnnouncements] = useState<Announcement[]>([])
   const [reportNotifications, setReportNotifications] = useState<ReportNotification[]>([])
@@ -481,7 +511,10 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
   const [moderatedItems, setModeratedItems] = useState<ModeratedItem[]>([])
   const [dismissedAnnouncements, setDismissedAnnouncements] = useState<string[]>(() => loadStored<string[]>(storageKeys.dismissedAnnouncements, []))
   const [activeChatHandle, setActiveChatHandle] = useState('')
+  const [mutedChatHandles, setMutedChatHandles] = useState<string[]>([])
+  const [blockedUsers, setBlockedUsers] = useState<Person[]>([])
   const [chatMode, setChatMode] = useState<'public' | 'room'>('public')
+  const [roomMinimized, setRoomMinimized] = useState(false)
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([])
   const [crewInvitations, setCrewInvitations] = useState<CrewInvitation[]>([])
   const [dismissedSuggestions, setDismissedSuggestions] = useState<string[]>(() => loadStored<string[]>(`youtopic-dismissed-suggestions-${currentUser.handle}`, []))
@@ -506,6 +539,7 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
   const [coverImageDraft, setCoverImageDraft] = useState(currentUser.coverImage ?? '')
   const [socialLinksDraft, setSocialLinksDraft] = useState<SocialProfileLink[]>(() => Object.entries(currentUser.socialLinks ?? {}).map(([platform, url], index) => ({ id: index, platform: platform as SocialPlatform, url })))
   const [profileVisibilityDraft, setProfileVisibilityDraft] = useState<ProfileVisibilitySettings>(() => ({ ...defaultProfileVisibility, ...currentUser.profileVisibility, contactPhone: currentUser.profileVisibility?.contactPhone ?? 'private', secondContactPhone: currentUser.profileVisibility?.secondContactPhone ?? 'private' }))
+  const [socialPrivacyDraft, setSocialPrivacyDraft] = useState<SocialPrivacy>(() => ({ profileAudience: currentUser.socialPrivacy?.profileAudience ?? 'public', crewInviteAudience: currentUser.socialPrivacy?.crewInviteAudience ?? 'everyone' }))
   const fileInput = useRef<HTMLInputElement>(null)
   const searchInputRef = useRef<HTMLInputElement>(null)
   const linkedProfileHandledRef = useRef(false)
@@ -513,6 +547,8 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
   const storyTextInput = useRef<HTMLInputElement>(null)
   const personalStoryFileInput = useRef<HTMLInputElement>(null)
   const topikiFeedRef = useRef<HTMLDivElement>(null)
+  const feedSentinelRef = useRef<HTMLDivElement>(null)
+  const loadingMorePostsRef = useRef(false)
   const voiceRecorderRef = useRef<MediaRecorder | null>(null)
   const voiceStreamRef = useRef<MediaStream | null>(null)
   const voiceChunksRef = useRef<Blob[]>([])
@@ -560,14 +596,34 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
   useEffect(() => {
     let active = true
     let hasLoaded = false
+    setPostsLoading(true)
+    setPostsError('')
+    setPostsPageError('')
+    setPostsCursor(null)
+    setHasMorePosts(false)
     const refreshPosts = async () => {
       try {
-        const { posts: remotePosts } = await authRequest<{ posts: Post[] }>('/api/posts')
+        const result = await authRequest<{ posts: Post[]; hasMore: boolean; nextCursor: PostCursor | null }>('/api/posts?limit=30')
         if (!active) return
-        setPosts((current) => [...remotePosts, ...current.filter((post) => !post.serverBacked)])
+        setPosts((current) => {
+          const freshIds = new Set(result.posts.map((post) => post.id))
+          return [...result.posts, ...current.filter((post) => !freshIds.has(post.id))]
+            .sort((first, second) => (second.createdAt ?? second.id) - (first.createdAt ?? first.id))
+        })
+        if (!hasLoaded) {
+          setPostsCursor(result.nextCursor)
+          setHasMorePosts(result.hasMore)
+          setPostsPageError('')
+        }
         hasLoaded = true
+        setPostsLoading(false)
+        setPostsError('')
       } catch (error: unknown) {
-        if (active && !hasLoaded) setNotice(error instanceof Error ? error.message : 'Nie udało się pobrać postów z serwera.')
+        if (active) {
+          const message = error instanceof Error ? error.message : 'Nie udało się pobrać postów z serwera.'
+          if (!hasLoaded) setPostsLoading(false)
+          setPostsError(message)
+        }
       }
     }
     void refreshPosts()
@@ -581,7 +637,37 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
       document.removeEventListener('visibilitychange', refreshOnFocus)
       window.removeEventListener('focus', refreshOnFocus)
     }
-  }, [currentUser.id])
+  }, [currentUser.id, postsRetryKey])
+
+  useEffect(() => {
+    const target = feedSentinelRef.current
+    if (!target || !hasMorePosts || postsLoading || loadingMorePosts || postsPageError
+      || view === 'notifications' || view === 'support' || (view === 'home' && homeTab === 'chat')) return
+    const observer = new IntersectionObserver((entries) => {
+      if (!entries.some((entry) => entry.isIntersecting) || !postsCursor || loadingMorePostsRef.current) return
+      loadingMorePostsRef.current = true
+      setLoadingMorePosts(true)
+      const query = new URLSearchParams({ limit: '30', before: String(postsCursor.before), beforeId: String(postsCursor.beforeId) })
+      authRequest<{ posts: Post[]; hasMore: boolean; nextCursor: PostCursor | null }>(`/api/posts?${query}`)
+        .then((result) => {
+          setPosts((current) => {
+            const knownIds = new Set(current.map((post) => post.id))
+            return [...current, ...result.posts.filter((post) => !knownIds.has(post.id))]
+              .sort((first, second) => (second.createdAt ?? second.id) - (first.createdAt ?? first.id))
+          })
+          setPostsCursor(result.nextCursor)
+          setHasMorePosts(result.hasMore)
+          setPostsPageError('')
+        })
+        .catch((error: unknown) => setPostsPageError(error instanceof Error ? error.message : 'Nie udało się załadować kolejnych wpisów.'))
+        .finally(() => {
+          loadingMorePostsRef.current = false
+          setLoadingMorePosts(false)
+        })
+    }, { rootMargin: '500px 0px' })
+    observer.observe(target)
+    return () => observer.disconnect()
+  }, [hasMorePosts, homeTab, loadingMorePosts, postsCursor, postsLoading, postsPageError, view])
 
   useEffect(() => {
     if (view !== 'support') return
@@ -633,14 +719,21 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
   }, [recordingPostId])
 
   const crewHandles = allUsers.filter((person) => person.handle !== currentUser.handle && crewLinks.some((link) => crewPairKey(link[0], link[1]) === crewPairKey(currentUser.handle, person.handle))).map((person) => person.handle)
-  const chatContacts = allUsers.filter((person) => person.handle !== currentUser.handle)
+  const isBlockedUser = (person: Person) => Boolean(person.id && blockedUsers.some((user) => user.id === person.id))
+  const chatContacts = allUsers.filter((person) => person.handle !== currentUser.handle && !isBlockedUser(person))
   const activeChat = chatContacts.find((person) => person.handle === activeChatHandle) ?? null
   const isMessageModerated = (message: ChatMessage) => moderatedItems.some((item) =>
     item.targetType === 'message' && item.targetId === `message:${message.id}` && item.targetUserId === message.author.id)
-  const publicChatMessages = chatMessages.filter((message) => message.scope === 'public' && !isMessageModerated(message))
+  const publicChatMessages = chatMessages.filter((message) => message.scope === 'public' && !isMessageModerated(message) && !isBlockedUser(message.author))
   const roomMessages = chatMessages.filter((message) => message.scope === 'room' && !isMessageModerated(message) && activeChat && ((message.author.handle === currentUser.handle && message.recipientHandle === activeChat.handle) || (message.author.handle === activeChat.handle && message.recipientHandle === currentUser.handle)))
   const incomingCrewInvitations = crewInvitations.filter((invitation) => invitation.to.handle === currentUser.handle && invitation.status === 'pending')
   const unreadNotificationCount = socialNotifications.filter((notification) => !notification.readAt).length
+  const unreadChatCounts = socialNotifications.reduce((counts, notification) => {
+    if (notification.type === 'chat_message' && !notification.readAt && notification.chatHandle) {
+      counts.set(notification.chatHandle, (counts.get(notification.chatHandle) ?? 0) + 1)
+    }
+    return counts
+  }, new Map<string, number>())
   const suppressedSuggestionHandles = crewInvitations.filter((invitation) => invitation.from.handle === currentUser.handle && (invitation.status === 'pending' || (invitation.status === 'declined' && clockNow - (invitation.respondedAt ?? 0) < 24 * 60 * 60 * 1000))).map((invitation) => invitation.to.handle)
   const activeRoomInvitation = activeChat && crewInvitations.find((invitation) => invitation.status === 'pending' && crewPairKey(invitation.from.handle, invitation.to.handle) === crewPairKey(currentUser.handle, activeChat.handle))
   const accessibleBands = bands.filter((item) => item.adminHandle === currentUser.handle || item.memberHandles.includes(currentUser.handle))
@@ -649,7 +742,7 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
     return counts
   }, new Map<string, number>())
   const suggestedProfiles = platformUsers
-    .filter((person) => person.handle !== currentUser.handle && !crewHandles.includes(person.handle) && !dismissedSuggestions.includes(person.handle) && !suppressedSuggestionHandles.includes(person.handle))
+    .filter((person) => person.handle !== currentUser.handle && !isBlockedUser(person) && !crewHandles.includes(person.handle) && !dismissedSuggestions.includes(person.handle) && !suppressedSuggestionHandles.includes(person.handle))
     .sort((first, second) => (profileBoostCounts.get(second.handle) ?? 0) - (profileBoostCounts.get(first.handle) ?? 0))
   const band = accessibleBands.find((item) => item.id === activeBandId) ?? accessibleBands[0] ?? null
   const bandMembers = band ? allUsers.filter((person) => band.memberHandles.includes(person.handle)) : []
@@ -720,6 +813,7 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
     : view === 'band'
       ? Boolean(band) && !isCreatingBand
       : view === 'explore' || view === 'topiki' || view === 'crew' || view === 'saved' || view === 'profile'
+  const showProfilePosts = view !== 'profile' || profileTab === 'posts'
 
   useEffect(() => {
     let active = true
@@ -727,15 +821,16 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
       try {
         const [{ users }, crew, bandResult] = await Promise.all([
           authRequest<{ users: Person[] }>('/api/users'),
-          authRequest<{ links: CrewLink[]; invitations: CrewInvitation[] }>('/api/crew'),
+          authRequest<{ links: CrewLink[]; invitations: CrewInvitation[]; memberCount: number }>('/api/crew'),
           authRequest<{ bands: Band[] }>('/api/bands'),
         ])
         if (!active) return
-        const peopleOnPlatform = mergePeople(users, [currentUser])
+        const userWithCrewCount = { ...currentUser, crewMembers: crew.memberCount, crewSize: crew.memberCount }
+        const peopleOnPlatform = mergePeople(users, [userWithCrewCount])
         setPlatformUsers(peopleOnPlatform)
         setAllUsers((current) => mergePeople(people, current, peopleOnPlatform))
         setProfile((current) => current.handle === currentUser.handle
-          ? current
+          ? userWithCrewCount
           : peopleOnPlatform.find((person) => person.handle === current.handle) ?? current)
         setCrewLinks(crew.links)
         setCrewInvitations(crew.invitations)
@@ -759,8 +854,15 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
     let active = true
     const refreshNotifications = async () => {
       try {
-        const { notifications } = await authRequest<{ notifications: SocialNotification[] }>('/api/notifications')
-        if (active) setSocialNotifications(notifications)
+        const [{ notifications }, crew] = await Promise.all([
+          authRequest<{ notifications: SocialNotification[] }>('/api/notifications'),
+          authRequest<{ links: CrewLink[]; invitations: CrewInvitation[] }>('/api/crew'),
+        ])
+        if (active) {
+          setSocialNotifications(notifications)
+          setCrewInvitations(crew.invitations)
+          setCrewLinks(crew.links)
+        }
       } catch (error: unknown) {
         if (active) setNotice(error instanceof Error ? error.message : 'Nie udało się pobrać powiadomień.')
       }
@@ -778,21 +880,14 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
 
   useEffect(() => {
     let active = true
-    const scope = chatMode === 'room' ? 'room' : 'public'
-    const roomQuery = scope === 'room' ? `&with=${encodeURIComponent(activeChatHandle)}` : ''
+    if (view !== 'home' || homeTab !== 'chat' || chatMode !== 'public') return
     const refreshChat = async () => {
-      if (scope === 'room' && !activeChatHandle) return
-      if (scope === 'room' && !crewLinks.some((link) => crewPairKey(link[0], link[1]) === crewPairKey(currentUser.handle, activeChatHandle))) return
       try {
-        const { messages } = await authRequest<{ messages: ChatMessage[] }>(`/api/chat?scope=${scope}${roomQuery}`)
+        const { messages } = await authRequest<{ messages: ChatMessage[] }>('/api/chat?scope=public')
         if (!active) return
-        setChatMessages((current) => [
-          ...current.filter((message) => message.scope !== scope
-            || scope === 'room' && message.recipientHandle !== activeChatHandle && message.author.handle !== activeChatHandle),
-          ...messages,
-        ])
+        setChatMessages((current) => [...current.filter((message) => message.scope !== 'public'), ...messages])
       } catch (error: unknown) {
-        if (active && scope === 'room') setNotice(error instanceof Error ? error.message : 'Nie udało się pobrać prywatnych wiadomości.')
+        if (active) setNotice(error instanceof Error ? error.message : 'Nie udało się pobrać wiadomości czatu.')
       }
     }
     void refreshChat()
@@ -801,14 +896,47 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
       active = false
       window.clearInterval(timer)
     }
-  }, [activeChatHandle, chatMode, crewLinks, currentUser.handle, currentUser.id])
+  }, [chatMode, currentUser.id, homeTab, view])
 
   useEffect(() => {
-    if (view !== 'notifications') return
-    void authPatch<{ ok: true }>('/api/notifications/read', {})
-      .then(() => setSocialNotifications((current) => current.map((item) => item.readAt ? item : { ...item, readAt: Date.now() })))
-      .catch((error: unknown) => setNotice(error instanceof Error ? error.message : 'Nie udało się oznaczyć powiadomień jako przeczytanych.'))
-  }, [view])
+    let active = true
+    if (view !== 'home' || homeTab !== 'chat' || !activeChatHandle || (chatMode !== 'room' && !roomMinimized)) return
+    if (!crewLinks.some((link) => crewPairKey(link[0], link[1]) === crewPairKey(currentUser.handle, activeChatHandle))) return
+    const refreshRoom = async () => {
+      try {
+        const { messages } = await authRequest<{ messages: ChatMessage[] }>(`/api/chat?scope=room&with=${encodeURIComponent(activeChatHandle)}`)
+        if (!active) return
+        setChatMessages((current) => [
+          ...current.filter((message) => message.scope !== 'room'
+            || message.recipientHandle !== activeChatHandle && message.author.handle !== activeChatHandle),
+          ...messages,
+        ])
+      } catch (error: unknown) {
+        if (active) setNotice(error instanceof Error ? error.message : 'Nie udało się pobrać prywatnych wiadomości.')
+      }
+    }
+    void refreshRoom()
+    const timer = window.setInterval(() => { if (document.visibilityState === 'visible') void refreshRoom() }, 7000)
+    return () => {
+      active = false
+      window.clearInterval(timer)
+    }
+  }, [activeChatHandle, chatMode, crewLinks, currentUser.handle, homeTab, roomMinimized, view])
+
+  useEffect(() => {
+    let active = true
+    Promise.all([
+      authRequest<{ users: Person[] }>('/api/blocks'),
+      authRequest<{ handles: string[] }>('/api/chat/mutes'),
+    ]).then(([blocks, mutes]) => {
+      if (!active) return
+      setBlockedUsers(blocks.users)
+      setMutedChatHandles(mutes.handles)
+    }).catch((error: unknown) => {
+      if (active) setNotice(error instanceof Error ? error.message : 'Nie udało się pobrać ustawień blokad i wyciszeń.')
+    })
+    return () => { active = false }
+  }, [currentUser.id])
 
   useEffect(() => {
     const query = search.trim()
@@ -860,6 +988,7 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
       setHomeTab(restored.homeTab)
       setChatMode(restored.chatMode)
       setActiveChatHandle(restored.activeChatHandle)
+      setRoomMinimized(restored.chatMode === 'public' && Boolean(restored.activeChatHandle))
       setSelectedTopic(restored.selectedTopic)
       setSearch(restored.search)
       setProfile(allUsersRef.current.find((person) => person.handle === restored.profileHandle) ?? currentUser)
@@ -912,10 +1041,6 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
   }, [allUsers])
 
   useEffect(() => {
-    saveStored(storageKeys.feedPosts, posts.filter((post) => !post.bandId))
-  }, [posts])
-
-  useEffect(() => {
     const savedStories = bandStories
       .filter((story) => story.expiresAt > clockNow && (!story.media?.startsWith('blob:') || Boolean(story.text)))
       .map((story) => story.media?.startsWith('blob:') ? { ...story, media: undefined, mediaKind: undefined } : story)
@@ -936,7 +1061,6 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
       if (event.key === storageKeys.followedTopics(currentUser.handle)) setFollowedTopics(loadStored(storageKeys.followedTopics(currentUser.handle), []))
       if (event.key === storageKeys.bandStories) setBandStories(loadStored<BandStory[]>(storageKeys.bandStories, []).filter((story) => story.expiresAt > Date.now()))
       if (event.key === storageKeys.users) setAllUsers(mergePeople(people, loadStored<Person[]>(storageKeys.users, []), [currentUser]))
-      if (event.key === storageKeys.feedPosts) setPosts(loadStored<Post[]>(storageKeys.feedPosts, initialPosts))
     }
     window.addEventListener('storage', syncSharedBands)
     return () => window.removeEventListener('storage', syncSharedBands)
@@ -994,6 +1118,14 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
     if (isBandView) result = [...result].sort((first, second) => Number(Boolean(second.pinnedAt)) - Number(Boolean(first.pinnedAt)) || (second.pinnedAt ?? 0) - (first.pinnedAt ?? 0))
     return result
   }, [band?.id, crewHandles, currentUser.handle, feedMode, followedTopics, homeTab, isBandView, moderatedItems, posts, profile.handle, search, selectedTopic, topikiPosts, view])
+
+  useEffect(() => {
+    if (pendingPostNavigationId === null) return
+    const post = filteredPosts.find((item) => item.id === pendingPostNavigationId)
+    if (!post) return
+    document.getElementById(`post-${pendingPostNavigationId}`)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    setPendingPostNavigationId(null)
+  }, [filteredPosts, pendingPostNavigationId])
 
   useEffect(() => {
     if (view !== 'topiki') return
@@ -1076,6 +1208,25 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
     setProfile(currentUser)
   }
 
+  async function openNotificationPost(postId: string) {
+    try {
+      const { post } = await authRequest<{ post: Post }>(`/api/posts/${encodeURIComponent(postId)}`)
+      setPosts((current) => current.some((item) => item.id === post.id)
+        ? current.map((item) => item.id === post.id ? post : item)
+        : [post, ...current])
+      const destination: View = post.bandId ? 'band' : 'explore'
+      if (post.bandId) setActiveBandId(post.bandId)
+      pushNavigation({ view: destination, homeTab: 'board', selectedTopic: post.bandId ? '' : post.topic, search: '' })
+      setView(destination)
+      setHomeTab('board')
+      setSelectedTopic(post.bandId ? '' : post.topic)
+      setSearch('')
+      setPendingPostNavigationId(post.id)
+    } catch (error: unknown) {
+      setNotice(error instanceof Error ? error.message : 'Nie udało się otworzyć posta z powiadomienia.')
+    }
+  }
+
   function toggleFollowTopic(topic: string) {
     const key = normalizeTopicName(topic)
     setFollowedTopics((current) => current.includes(key) ? current.filter((item) => item !== key) : [...current, key])
@@ -1102,27 +1253,48 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
     const selectedProfile = allUsers.find((candidate) => candidate.handle === person.handle) ?? person
     pushNavigation({ view: 'profile', profileHandle: selectedProfile.handle, search: '' })
     setProfile(selectedProfile)
+    setProfileTab('posts')
     setView('profile')
     setSearch('')
   }
 
-  async function reportContent(targetType: 'profile' | 'post' | 'photo' | 'video' | 'comment' | 'message', targetId: string, target: Person, contentPreview = '', contentUrl = '') {
+  function reportContent(targetType: 'profile' | 'post' | 'photo' | 'video' | 'comment' | 'message', targetId: string, target: Person, contentPreview = '', contentUrl = '') {
     if (!target.id || target.handle === currentUser.handle) {
       setNotice('Tę treść można zgłosić po powiązaniu jej autora z kontem platformy.')
       window.setTimeout(() => setNotice(''), 3000)
       return
     }
-    const reason = window.prompt(`Dlaczego zgłaszasz ${reportTypeName(targetType)}${targetType === 'profile' ? ` ${target.name}` : ''}?`)
-    if (!reason?.trim()) return
+    setReportDraft({
+      targetType,
+      targetId,
+      targetUserId: target.id,
+      targetName: target.name,
+      contentPreview: contentPreview.slice(0, 1000),
+      contentUrl: /^https?:\/\//i.test(contentUrl) ? contentUrl.slice(0, 2048) : '',
+      reasonCategory: 'other',
+      reason: '',
+    })
+  }
+
+  async function submitReportDraft() {
+    if (!reportDraft) return
+    const reason = reportDraft.reason.trim()
+    if (!reason) {
+      setNotice('Dodaj krótkie uzasadnienie zgłoszenia.')
+      window.setTimeout(() => setNotice(''), 2600)
+      return
+    }
     try {
       await authRequest('/api/reports', {
-        targetType,
-        targetId,
-        targetUserId: target.id,
-        reason: reason.trim(),
-        contentPreview: contentPreview.slice(0, 1000),
-        contentUrl: /^https?:\/\//i.test(contentUrl) ? contentUrl.slice(0, 2048) : '',
+        targetType: reportDraft.targetType,
+        targetId: reportDraft.targetId,
+        targetUserId: reportDraft.targetUserId,
+        reasonCategory: reportDraft.reasonCategory,
+        reason,
+        contentPreview: reportDraft.contentPreview,
+        contentUrl: reportDraft.contentUrl,
       })
+      setReportDraft(null)
       setNotice('Dziękujemy. Zgłoszenie zostało przekazane do zespołu moderacji.')
       window.setTimeout(() => setNotice(''), 3000)
     } catch (reportError) {
@@ -1151,27 +1323,29 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
     window.setTimeout(() => setNotice(''), 2600)
   }
 
-  function boostProfileOnBoard(person: Person) {
+  async function boostProfileOnBoard(person: Person) {
     if (person.handle === currentUser.handle) return
-    pushNavigation({ view: 'home', homeTab: 'board', profileHandle: currentUser.handle, selectedTopic: '', search: '' })
-    setPosts((current) => [{
-      id: Date.now(),
-      author: currentUser,
-      time: 'teraz',
-      topic: 'POLECANY PROFIL',
-      text: `${currentUser.name} podbija ten profil`,
-      likes: 0,
-      comments: [],
-      boosts: 0,
-      liked: false,
-      saved: false,
-      profileTarget: person,
-    }, ...current])
-    setProfileBoostTarget(null)
-    setView('home')
-    setHomeTab('board')
-    setNotice(`Profil ${person.name} podbity na tablicy`)
-    window.setTimeout(() => setNotice(''), 2600)
+    if (!person.id) {
+      setNotice('Można polecać tylko aktywne profile użytkowników YouTopic.')
+      window.setTimeout(() => setNotice(''), 3000)
+      return
+    }
+    try {
+      const { post } = await authRequest<{ post: Post }>('/api/posts', {
+        topic: 'POLECANY PROFIL',
+        text: `${currentUser.name} poleca profil ${person.name}.`,
+        profileTargetUserId: person.id,
+      })
+      setPosts((current) => [post, ...current.filter((item) => item.id !== post.id)])
+      setProfileBoostTarget(null)
+      pushNavigation({ view: 'home', homeTab: 'board', profileHandle: currentUser.handle, selectedTopic: '', search: '' })
+      setView('home')
+      setHomeTab('board')
+      setNotice(`Polecenie profilu ${person.name} opublikowane na tablicy`)
+    } catch (error: unknown) {
+      setNotice(error instanceof Error ? error.message : 'Nie udało się polecić profilu.')
+    }
+    window.setTimeout(() => setNotice(''), 3000)
   }
 
   async function toggleCrew(person: Person) {
@@ -1193,6 +1367,48 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
     window.setTimeout(() => setNotice(''), 2600)
   }
 
+  async function toggleUserBlock(person: Person) {
+    if (!person.id || person.id === currentUser.id) return
+    const isBlocked = blockedUsers.some((user) => user.id === person.id)
+    try {
+      if (isBlocked) {
+        await authDelete<{ ok: true }>(`/api/users/${encodeURIComponent(person.id)}/block`)
+        setBlockedUsers((current) => current.filter((user) => user.id !== person.id))
+        setNotice(`Odblokowano @${person.nickname ?? person.handle}`)
+      } else {
+        await authRequest<{ ok: true }>(`/api/users/${encodeURIComponent(person.id)}/block`, {})
+        setBlockedUsers((current) => [...current, person])
+        setCrewLinks((current) => current.filter((link) => crewPairKey(link[0], link[1]) !== crewPairKey(currentUser.handle, person.handle)))
+        setPosts((current) => current.filter((post) => post.author.id !== person.id))
+        setChatMessages((current) => current.filter((message) => message.author.id !== person.id))
+        setSocialNotifications((current) => current.filter((notification) => notification.actor?.id !== person.id))
+        setNotice(`Zablokowano @${person.nickname ?? person.handle}`)
+      }
+      window.setTimeout(() => setNotice(''), 2600)
+    } catch (error: unknown) {
+      setNotice(error instanceof Error ? error.message : 'Nie udało się zmienić blokady użytkownika.')
+    }
+  }
+
+  async function toggleChatMute(handle: string) {
+    const muted = mutedChatHandles.includes(handle)
+    try {
+      if (muted) {
+        await authDelete<{ ok: true }>(`/api/chat/${encodeURIComponent(handle)}/mute`)
+        setMutedChatHandles((current) => current.filter((item) => item !== handle))
+      } else {
+        await authRequest<{ ok: true }>(`/api/chat/${encodeURIComponent(handle)}/mute`, {})
+        setMutedChatHandles((current) => [...current, handle])
+        setSocialNotifications((current) => current.map((item) =>
+          item.type === 'chat_message' && item.chatHandle === handle
+            ? { ...item, readAt: item.readAt ?? Date.now() }
+            : item))
+      }
+    } catch (error: unknown) {
+      setNotice(error instanceof Error ? error.message : 'Nie udało się zmienić wyciszenia rozmowy.')
+    }
+  }
+
   async function cancelCrewInvitation(person: Person) {
     const invitation = crewInvitations.find((item) => item.from.handle === currentUser.handle && item.to.handle === person.handle && item.status === 'pending')
     if (!invitation) return
@@ -1207,9 +1423,46 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
   }
 
   function openChatRoom(person: Person) {
+    void markChatNotificationsRead(person.handle)
     pushNavigation({ view: 'home', homeTab: 'chat', chatMode: 'room', activeChatHandle: person.handle })
     setActiveChatHandle(person.handle)
     setChatMode('room')
+    setRoomMinimized(false)
+    setChatDraft('')
+  }
+
+  async function markChatNotificationsRead(handle: string) {
+    if (!socialNotifications.some((item) => item.type === 'chat_message' && item.chatHandle === handle && !item.readAt)) return
+    try {
+      await authPatch<{ ok: true }>('/api/notifications/read', { chatHandle: handle })
+      setSocialNotifications((current) => current.map((item) =>
+        item.type === 'chat_message' && item.chatHandle === handle && !item.readAt
+          ? { ...item, readAt: Date.now() }
+          : item))
+    } catch (error: unknown) {
+      setNotice(error instanceof Error ? error.message : 'Nie udało się oznaczyć rozmowy jako przeczytanej.')
+    }
+  }
+
+  function minimizeChatRoom() {
+    if (!activeChat) return
+    pushNavigation({ view: 'home', homeTab: 'chat', chatMode: 'public', activeChatHandle: activeChat.handle })
+    setChatMode('public')
+    setRoomMinimized(true)
+  }
+
+  function restoreChatRoom() {
+    if (!activeChat) return
+    pushNavigation({ view: 'home', homeTab: 'chat', chatMode: 'room', activeChatHandle: activeChat.handle })
+    setChatMode('room')
+    setRoomMinimized(false)
+  }
+
+  function closeChatRoom() {
+    pushNavigation({ view: 'home', homeTab: 'chat', chatMode: 'public', activeChatHandle: '' })
+    setChatMode('public')
+    setActiveChatHandle('')
+    setRoomMinimized(false)
     setChatDraft('')
   }
 
@@ -1254,6 +1507,7 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
     setCoverImageDraft(currentUser.coverImage ?? '')
     setSocialLinksDraft(Object.entries(currentUser.socialLinks ?? {}).map(([platform, url], index) => ({ id: index, platform: platform as SocialPlatform, url })))
     setProfileVisibilityDraft({ ...defaultProfileVisibility, ...currentUser.profileVisibility, contactPhone: currentUser.profileVisibility?.contactPhone ?? 'private', secondContactPhone: currentUser.profileVisibility?.secondContactPhone ?? 'private' })
+    setSocialPrivacyDraft({ profileAudience: currentUser.socialPrivacy?.profileAudience ?? 'public', crewInviteAudience: currentUser.socialPrivacy?.crewInviteAudience ?? 'everyone' })
     setProfileError('')
     setIsEditingProfile(true)
   }
@@ -1278,6 +1532,7 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
         coverImage: coverImageDraft,
         socialLinks,
         profileVisibility: profileVisibilityDraft,
+        socialPrivacy: socialPrivacyDraft,
       })
       const updatedUser = result.user
       onCurrentUserUpdate(updatedUser)
@@ -1315,6 +1570,7 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
       setCoverImageDraft(updatedUser.coverImage ?? '')
       setSocialLinksDraft(Object.entries(updatedUser.socialLinks ?? {}).map(([platform, url], index) => ({ id: index, platform: platform as SocialPlatform, url })))
       setProfileVisibilityDraft({ ...defaultProfileVisibility, ...updatedUser.profileVisibility, contactPhone: updatedUser.profileVisibility?.contactPhone ?? 'private', secondContactPhone: updatedUser.profileVisibility?.secondContactPhone ?? 'private' })
+      setSocialPrivacyDraft({ profileAudience: updatedUser.socialPrivacy?.profileAudience ?? 'public', crewInviteAudience: updatedUser.socialPrivacy?.crewInviteAudience ?? 'everyone' })
       setIsEditingProfile(false)
       setNotice('Profil został zaktualizowany')
       window.setTimeout(() => setNotice(''), 2600)
@@ -1339,6 +1595,7 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
     setCoverImageDraft(currentUser.coverImage ?? '')
     setSocialLinksDraft(Object.entries(currentUser.socialLinks ?? {}).map(([platform, url], index) => ({ id: index, platform: platform as SocialPlatform, url })))
     setProfileVisibilityDraft({ ...defaultProfileVisibility, ...currentUser.profileVisibility, contactPhone: currentUser.profileVisibility?.contactPhone ?? 'private', secondContactPhone: currentUser.profileVisibility?.secondContactPhone ?? 'private' })
+    setSocialPrivacyDraft({ profileAudience: currentUser.socialPrivacy?.profileAudience ?? 'public', crewInviteAudience: currentUser.socialPrivacy?.crewInviteAudience ?? 'everyone' })
     setProfileError('')
     setIsEditingProfile(false)
   }
@@ -1357,9 +1614,9 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
     }
   }
 
-  async function respondToCrewInvitation(invitationId: string, accept: boolean) {
+  async function respondToCrewInvitation(invitationId: string, accept: boolean): Promise<boolean> {
     const invitation = crewInvitations.find((item) => item.id === invitationId)
-    if (!invitation) return
+    if (!invitation) return false
     try {
       await authRequest<{ ok: true }>(`/api/crew/invitations/${encodeURIComponent(invitationId)}/respond`, { accept })
       setCrewInvitations((current) => current.map((item) => item.id === invitationId ? { ...item, status: accept ? 'accepted' : 'declined', respondedAt: Date.now() } : item))
@@ -1368,8 +1625,10 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
           ? current
           : [...current, [invitation.from.handle, invitation.to.handle]])
       }
+      return true
     } catch (error: unknown) {
       setNotice(error instanceof Error ? error.message : 'Nie udało się odpowiedzieć na zaproszenie.')
+      return false
     }
   }
 
@@ -1868,11 +2127,14 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
     window.setTimeout(() => setNotice(''), 2600)
   }
 
-  function pinBandPost(postId: number) {
+  async function pinBandPost(postId: number) {
     if (!band || !isBandView) return
-    setPosts((current) => current.map((post) => post.id === postId && post.bandId === band.id
-      ? { ...post, pinnedAt: post.pinnedAt ? undefined : Date.now() }
-      : post))
+    try {
+      const { post } = await authRequest<{ post: Post }>(`/api/posts/${postId}/pin`, {})
+      replaceSyncedPost(post)
+    } catch (error: unknown) {
+      showPostError(error, 'Nie udało się zmienić przypięcia posta.')
+    }
   }
 
   async function sharePublicPostToBand(postId: number, targetBandId: string) {
@@ -1911,6 +2173,34 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
     support: 'Centrum pomocy',
     saved: 'Zapisane posty',
     profile: profile.handle === currentUser.handle ? 'Twój profil' : profile.name,
+  }
+  const isPostFeedView = view !== 'notifications' && view !== 'support' && !(view === 'home' && homeTab === 'chat')
+
+  function renderPrivateRoom(isMinimized: boolean) {
+    if (!activeChat) return null
+    return <section className={`chat-private-room ${isMinimized ? 'is-minimized' : ''}`} aria-label={`Prywatny chat @${activeChat.nickname ?? activeChat.handle}`}>
+      <header className="chat-room-header">
+        <button className="chat-person-button" onClick={isMinimized ? restoreChatRoom : () => openProfile(activeChat)}>
+          <img src={activeChat.avatar} alt="" />
+          <span><strong>@{activeChat.nickname ?? activeChat.handle}{activeChat.profileVerified && <BadgeCheck className="verified-profile-badge" size={13} aria-label="Zweryfikowany profil" />}</strong><small>{isMinimized ? 'Przywróć chat' : 'Pokój prywatny'}</small></span>
+        </button>
+        <div className="chat-room-window-actions">
+          {!isMinimized && <button type="button" onClick={() => void toggleChatMute(activeChat.handle)} aria-label={mutedChatHandles.includes(activeChat.handle) ? 'Włącz powiadomienia rozmowy' : 'Wycisz powiadomienia rozmowy'} title={mutedChatHandles.includes(activeChat.handle) ? 'Włącz powiadomienia' : 'Wycisz powiadomienia'}>{mutedChatHandles.includes(activeChat.handle) ? <Bell size={16} /> : <BellOff size={16} />}</button>}
+          <button type="button" onClick={isMinimized ? restoreChatRoom : minimizeChatRoom} aria-label={isMinimized ? 'Otwórz chat' : 'Minimalizuj chat'} title={isMinimized ? 'Otwórz chat' : 'Minimalizuj chat'}>{isMinimized ? <Maximize2 size={16} /> : <Minimize2 size={16} />}</button>
+          <button type="button" onClick={closeChatRoom} aria-label="Zamknij chat" title="Zamknij chat"><X size={17} /></button>
+        </div>
+      </header>
+      {!isMinimized && <>
+        {activeRoomInvitation?.to.handle === currentUser.handle && <div className="room-invitation-banner">{activeRoomInvitation.from.nickname ?? activeRoomInvitation.from.handle} zaprasza Cię do Ekipy.<button onClick={() => respondToCrewInvitation(activeRoomInvitation.id, true)}>Akceptuj</button><button className="decline-invite" onClick={() => respondToCrewInvitation(activeRoomInvitation.id, false)}>Odrzuć</button></div>}
+        {activeRoomInvitation?.from.handle === currentUser.handle && <div className="room-invitation-status">Zaproszenie do Ekipy czeka na odpowiedź.</div>}
+        <div className="chat-room-messages" aria-live="polite">
+          {!crewHandles.includes(activeChat.handle) && <div className="chat-intro"><span><LockKeyhole size={19} /></span><strong>Rozmowa prywatna</strong><p>Wiadomości 1:1 będą dostępne po zaakceptowaniu zaproszenia do Ekipy.</p></div>}
+          {roomMessages.map((message) => <article className={`room-message ${message.author.handle === currentUser.handle ? 'from-you' : ''}`} key={message.id}>{message.author.handle !== currentUser.handle && <img src={message.author.avatar} alt="" />}<div><p>{message.text}</p><small>{message.time}</small>{message.author.id && message.author.id !== currentUser.id && <button className="chat-report-button" onClick={() => reportContent('message', `message:${message.id}`, message.author, message.text)} aria-label="Zgłoś wiadomość" title="Zgłoś wiadomość"><Flag size={13} />Zgłoś</button>}</div></article>)}
+        </div>
+        <div className="room-actions">{crewHandles.includes(activeChat.handle) ? <span className="room-crew-status"><Check size={15} /> Jesteście w Ekipie</span> : activeRoomInvitation ? <span className="room-crew-status">Zaproszenie wysłane</span> : <button onClick={() => void sendCrewInvitation(activeChat)}><UsersRound size={15} /> Zaproś do Ekipy</button>}</div>
+        <form className="chat-composer" onSubmit={sendRoomMessage}><input value={chatDraft} onChange={(event) => setChatDraft(event.target.value)} placeholder={crewHandles.includes(activeChat.handle) ? `Wiadomość do @${activeChat.nickname ?? activeChat.handle}...` : 'Dołączcie do Ekipy, aby rozmawiać prywatnie'} aria-label="Wiadomość prywatna" disabled={!crewHandles.includes(activeChat.handle)} /><button type="submit" disabled={!chatDraft.trim() || !crewHandles.includes(activeChat.handle)} aria-label="Wyślij wiadomość"><Send size={17} /></button></form>
+      </>}
+    </section>
   }
 
   return (
@@ -2079,30 +2369,26 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
           {view === 'home' && homeTab === 'chat' && <section className="chat-stage">
             {chatMode === 'public' ? <>
               <header className="chat-stage-heading"><div><span className="chat-kicker">ROZMOWA DLA WSZYSTKICH</span><h2>Czat YouTopic</h2><p>Napisz na forum albo wybierz osobę, żeby przejść do prywatnego Pokoju.</p></div><span className="chat-users-count"><UsersRound size={15} />{allUsers.length} osób</span></header>
-              {incomingCrewInvitations.length > 0 && <section className="chat-invitation-inbox" aria-label="Zaproszenia do Ekipy"><div className="chat-invitation-title"><UsersRound size={16} />Zaproszenia do Ekipy<span>{incomingCrewInvitations.length}</span></div>
-                {incomingCrewInvitations.map((invitation) => <div className="chat-invitation" key={invitation.id}><img src={invitation.from.avatar} alt="" /><p><strong>{invitation.from.nickname ?? invitation.from.handle}</strong> zaprasza Cię do swojej Ekipy.<small>Możecie wtedy widzieć swoje posty na tablicy.</small></p><button onClick={() => respondToCrewInvitation(invitation.id, true)}>Akceptuj</button><button className="decline-invite" onClick={() => respondToCrewInvitation(invitation.id, false)}>Odrzuć</button></div>)}
+              {unreadChatCounts.size > 0 && <section className="chat-unread-inbox" aria-label="Nieprzeczytane wiadomości">
+                <strong>PRYWATNE WIADOMOŚCI</strong>
+                <div>{[...unreadChatCounts].map(([handle, count]) => {
+                  const person = allUsers.find((candidate) => candidate.handle === handle)
+                  if (!person) return null
+                  return <button className="chat-unread-contact" key={handle} onClick={() => openChatRoom(person)}><img src={person.avatar} alt="" /><span>@{person.nickname ?? person.handle}</span><b>{count}</b></button>
+                })}</div>
               </section>}
               <div className="chat-public-messages" aria-live="polite">
                 {publicChatMessages.map((message) => <article className={`public-chat-message ${message.author.handle === currentUser.handle ? 'from-you' : ''}`} key={message.id}>
                   <button className="public-chat-avatar" onClick={() => openChatRoom(message.author)}><img src={message.author.avatar} alt="" />{message.author.online && <i />}</button>
-                  <div className="public-chat-message-body"><div className="public-chat-message-meta"><button onClick={() => openChatRoom(message.author)}>{message.author.handle === currentUser.handle || crewHandles.includes(message.author.handle) ? message.author.name : message.author.nickname ?? message.author.handle}{message.author.profileVerified && <BadgeCheck className="verified-profile-badge" size={13} aria-label="Zweryfikowany profil" />}</button><time>{message.time}</time></div><p>{message.text}</p></div>
+                  <div className="public-chat-message-body"><div className="public-chat-message-meta"><button onClick={() => openChatRoom(message.author)}>@{message.author.nickname ?? message.author.handle}{message.author.profileVerified && <BadgeCheck className="verified-profile-badge" size={13} aria-label="Zweryfikowany profil" />}</button><time>{message.time}</time></div><p>{message.text}</p></div>
                   {message.author.id && message.author.id !== currentUser.id && <button className="chat-report-button" onClick={() => void reportContent('message', `message:${message.id}`, message.author, message.text)} aria-label="Zgłoś wiadomość" title="Zgłoś wiadomość"><Flag size={15} /></button>}
                   <button className="public-chat-room-link" onClick={() => openChatRoom(message.author)} aria-label={`Napisz prywatnie do ${message.author.name}`} title="Przejdź do Pokoju"><MessageCircle size={16} /></button>
                 </article>)}
                 {publicChatMessages.length === 0 && <div className="chat-intro"><span><MessageCircle size={19} /></span><strong>Rozpocznij rozmowę</strong><p>Napisz wiadomość jako pierwszy.</p></div>}
               </div>
               <form className="chat-public-composer" onSubmit={sendPublicChatMessage}><input value={chatDraft} onChange={(event) => setChatDraft(event.target.value)} placeholder="Napisz do wszystkich..." aria-label="Wiadomość publiczna" /><button type="submit" disabled={!chatDraft.trim()} aria-label="Wyślij wiadomość"><Send size={17} /></button></form>
-            </> : activeChat ? <section className="chat-private-room">
-              <header className="chat-room-header"><button className="room-back-button" onClick={() => window.history.back()} aria-label="Wróć do czatu publicznego"><ChevronDown size={18} /></button><button className="chat-person-button" onClick={() => openProfile(activeChat)}><img src={activeChat.avatar} alt="" /><span><strong>{crewHandles.includes(activeChat.handle) ? activeChat.name : activeChat.nickname ?? activeChat.handle}{activeChat.profileVerified && <BadgeCheck className="verified-profile-badge" size={13} aria-label="Zweryfikowany profil" />}</strong><small>@{activeChat.nickname ?? activeChat.handle}</small></span></button><span className="outside-badge">Pokój prywatny</span></header>
-              {activeRoomInvitation?.to.handle === currentUser.handle && <div className="room-invitation-banner">{activeRoomInvitation.from.nickname ?? activeRoomInvitation.from.handle} zaprasza Cię do Ekipy.<button onClick={() => respondToCrewInvitation(activeRoomInvitation.id, true)}>Akceptuj</button><button className="decline-invite" onClick={() => respondToCrewInvitation(activeRoomInvitation.id, false)}>Odrzuć</button></div>}
-              {activeRoomInvitation?.from.handle === currentUser.handle && <div className="room-invitation-status">Zaproszenie do Ekipy czeka na odpowiedź.</div>}
-              <div className="chat-room-messages" aria-live="polite">
-                {!crewHandles.includes(activeChat.handle) && <div className="chat-intro"><span><LockKeyhole size={19} /></span><strong>Rozmowa prywatna</strong><p>Wiadomości 1:1 będą dostępne po zaakceptowaniu zaproszenia do Ekipy.</p></div>}
-                {roomMessages.map((message) => <article className={`room-message ${message.author.handle === currentUser.handle ? 'from-you' : ''}`} key={message.id}>{message.author.handle !== currentUser.handle && <img src={message.author.avatar} alt="" />}<div><p>{message.text}</p><small>{message.time}</small>{message.author.id && message.author.id !== currentUser.id && <button className="chat-report-button" onClick={() => void reportContent('message', `message:${message.id}`, message.author, message.text)} aria-label="Zgłoś wiadomość" title="Zgłoś wiadomość"><Flag size={13} />Zgłoś</button>}</div></article>)}
-              </div>
-              <div className="room-actions">{crewHandles.includes(activeChat.handle) ? <span className="room-crew-status"><Check size={15} /> Jesteście w Ekipie</span> : activeRoomInvitation ? <span className="room-crew-status">Zaproszenie wysłane</span> : <button onClick={() => sendCrewInvitation(activeChat)}><UsersRound size={15} /> Zaproś do Ekipy</button>}</div>
-              <form className="chat-composer" onSubmit={sendRoomMessage}><input value={chatDraft} onChange={(event) => setChatDraft(event.target.value)} placeholder={crewHandles.includes(activeChat.handle) ? `Wiadomość do ${activeChat.nickname ?? activeChat.handle}...` : 'Dołączcie do Ekipy, aby rozmawiać prywatnie'} aria-label="Wiadomość prywatna" disabled={!crewHandles.includes(activeChat.handle)} /><button type="submit" disabled={!chatDraft.trim() || !crewHandles.includes(activeChat.handle)} aria-label="Wyślij wiadomość"><Send size={17} /></button></form>
-            </section> : <div className="chat-no-contacts"><UsersRound size={24} /><strong>Nie znaleziono użytkownika</strong><p>Wróć do czatu publicznego i wybierz inną osobę.</p><button onClick={() => setChatMode('public')}>Wróć do czatu</button></div>}
+              {roomMinimized && activeChat && renderPrivateRoom(true)}
+            </> : activeChat ? renderPrivateRoom(false) : <div className="chat-no-contacts"><UsersRound size={24} /><strong>Nie znaleziono użytkownika</strong><p>Wróć do czatu publicznego i wybierz inną osobę.</p><button onClick={() => setChatMode('public')}>Wróć do czatu</button></div>}
           </section>}
 
           {isBandView && band && !isCreatingBand && <section className="band-switcher" aria-label="Twoje bandy">
@@ -2198,7 +2484,7 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
             {platformUsers.filter((person) => person.handle !== currentUser.handle).map((person) => {
               const isMember = crewHandles.includes(person.handle)
               const isPending = crewInvitations.some((invitation) => invitation.from.handle === currentUser.handle && invitation.to.handle === person.handle && invitation.status === 'pending')
-              const memberCount = person.crewMembers + Number(isMember)
+              const memberCount = person.crewMembers
               return <div className="crew-row" key={person.handle}><button className="crew-person" onClick={() => openProfile(person)}><img src={person.avatar} alt="" /><span><strong>{person.name}</strong><small>@{person.handle} · {memberCount} Ekipowiczów</small></span></button><button className={`follow-button ${isMember ? 'following' : ''} ${isPending ? 'invite-pending' : ''}`} onClick={() => toggleCrew(person)}>{isMember ? <><X size={14} /> Usuń z Ekipy</> : isPending ? <><X size={14} /> Anuluj zaproszenie</> : <><Plus size={14} /> Dodaj do Ekipy</>}</button></div>
             })}
             {platformUsers.filter((person) => person.handle !== currentUser.handle).length === 0 && <p className="crew-empty">Nie znaleziono jeszcze innych kont. Skorzystaj z wyszukiwarki, gdy pojawią się nowi użytkownicy.</p>}
@@ -2217,17 +2503,51 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
             {socialNotifications.map((notification) => {
               const Icon = notification.type === 'like' || notification.type === 'comment_like' ? Heart
                 : notification.type === 'boost' ? ArrowUp
-                  : UsersRound
-              return <button className={`notification-row ${notification.readAt ? '' : 'is-unread'}`} key={notification.id} onClick={() => {
+                  : notification.type === 'chat_message' ? MessageCircle
+                    : UsersRound
+              const invitation = notification.type === 'crew_invitation'
+                ? incomingCrewInvitations.find((item) => item.id === notification.crewInvitationId
+                  || item.from.handle === notification.actor?.handle)
+                : undefined
+              const markRead = () => {
                 if (notification.readAt) return
                 void authPatch<{ ok: true }>('/api/notifications/read', { id: notification.id })
                   .then(() => setSocialNotifications((current) => current.map((item) => item.id === notification.id ? { ...item, readAt: Date.now() } : item)))
                   .catch((error: unknown) => setNotice(error instanceof Error ? error.message : 'Nie udało się oznaczyć powiadomienia.'))
-              }}>
+              }
+              return <div className={`notification-row ${notification.readAt ? '' : 'is-unread'} ${invitation ? 'has-notification-actions' : ''}`} key={notification.id}>
                 <img src={notification.actor?.avatar ?? '/youtopic-mark.svg'} alt="" />
-                <p><strong>{notification.actor?.nickname ?? notification.actor?.handle ?? 'Użytkownik'}</strong> {notification.message}<small>{new Intl.DateTimeFormat('pl-PL', { dateStyle: 'medium', timeStyle: 'short' }).format(notification.createdAt)}</small></p>
-                {notification.readAt ? <Icon size={17} /> : <span className="notification-unread" />}
-              </button>
+                <button className="notification-main" type="button" onClick={() => {
+                  if (notification.type === 'chat_message' && notification.chatHandle) {
+                    const person = allUsers.find((candidate) => candidate.handle === notification.chatHandle)
+                      ?? (notification.actor?.handle === notification.chatHandle ? notification.actor : undefined)
+                    if (!person) {
+                      setNotice('Nie znaleziono użytkownika z tej rozmowy. Odśwież stronę i spróbuj ponownie.')
+                    } else {
+                      void markChatNotificationsRead(person.handle)
+                      setAllUsers((current) => current.some((candidate) => candidate.handle === person.handle) ? current : [...current, person])
+                      pushNavigation({ view: 'home', homeTab: 'chat', chatMode: 'room', activeChatHandle: person.handle })
+                      setView('home')
+                      setHomeTab('chat')
+                      setChatMode('room')
+                      setActiveChatHandle(person.handle)
+                      setRoomMinimized(false)
+                      setChatDraft('')
+                    }
+                  }
+                  if (notification.postId) void openNotificationPost(notification.postId)
+                  if (notification.type === 'crew_accepted') {
+                    pushNavigation({ view: 'crew', homeTab: 'board', chatMode: 'public', activeChatHandle: '' })
+                    setView('crew')
+                  }
+                  markRead()
+                }}>
+                  <p><strong>{notification.actor?.nickname ?? notification.actor?.handle ?? 'Użytkownik'}</strong> {notification.message}<small>{new Intl.DateTimeFormat('pl-PL', { dateStyle: 'medium', timeStyle: 'short' }).format(notification.createdAt)}</small></p>
+                </button>
+                {invitation
+                  ? <div className="notification-actions"><button type="button" onClick={() => { void respondToCrewInvitation(invitation.id, true).then((success) => { if (success) markRead() }) }}>Akceptuj</button><button type="button" className="decline-invite" onClick={() => { void respondToCrewInvitation(invitation.id, false).then((success) => { if (success) markRead() }) }}>Odrzuć</button></div>
+                  : notification.readAt ? <Icon size={17} /> : <span className="notification-unread" />}
+              </div>
             })}
             {socialNotifications.length === 0 && <p className="support-empty">Nie masz jeszcze powiadomień o aktywności.</p>}
             <SuggestedProfiles people={suggestedProfiles} boostCounts={profileBoostCounts} onOpen={openProfile} onAdd={sendCrewInvitation} onDismiss={dismissSuggestedProfile} />
@@ -2254,14 +2574,26 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
             </article>)}</div>
           </section>}
 
-          {view === 'profile' && <ProfileHeader person={profile} isOwn={profile.handle === currentUser.handle} isCrewMember={crewHandles.includes(profile.handle)} isEditingProfile={isEditingProfile} nicknameDraft={nicknameDraft} firstNameDraft={firstNameDraft} middleNameDraft={middleNameDraft} lastNameDraft={lastNameDraft} secondLastNameDraft={secondLastNameDraft} locationDraft={locationDraft} contactPhoneDraft={contactPhoneDraft} secondContactPhoneDraft={secondContactPhoneDraft} bioDraft={bioDraft} avatarDraft={avatarDraft} coverImageDraft={coverImageDraft} socialLinksDraft={socialLinksDraft} profileVisibilityDraft={profileVisibilityDraft} profileError={profileError} isSavingProfile={isSavingProfile} onEditProfile={beginProfileEdit} onNicknameDraftChange={setNicknameDraft} onFirstNameDraftChange={setFirstNameDraft} onMiddleNameDraftChange={setMiddleNameDraft} onLastNameDraftChange={setLastNameDraft} onSecondLastNameDraftChange={setSecondLastNameDraft} onLocationDraftChange={setLocationDraft} onContactPhoneDraftChange={setContactPhoneDraft} onSecondContactPhoneDraftChange={setSecondContactPhoneDraft} onBioDraftChange={setBioDraft} onSocialLinksDraftChange={setSocialLinksDraft} onProfileVisibilityDraftChange={setProfileVisibilityDraft} onImageChange={changeProfileImage} onSaveProfile={saveProfile} onCancelProfile={cancelProfileEdit} isCrewInvitationPending={crewInvitations.some((invitation) => invitation.from.handle === currentUser.handle && invitation.to.handle === profile.handle && invitation.status === 'pending')} isBandAdmin={Boolean(band && profile.handle === band.adminHandle)} onToggleCrew={() => toggleCrew(profile)} onPromote={() => setProfileBoostTarget(profile)} onReportProfile={() => void reportProfile(profile)} postCount={posts.filter((post) => post.author.handle === profile.handle).length} />}
+          {view === 'profile' && <ProfileHeader person={profile} isOwn={profile.handle === currentUser.handle} isCrewMember={crewHandles.includes(profile.handle)} isBlocked={blockedUsers.some((user) => user.id === profile.id)} blockedPeople={blockedUsers} onToggleBlock={(person) => void toggleUserBlock(person)} isEditingProfile={isEditingProfile} nicknameDraft={nicknameDraft} firstNameDraft={firstNameDraft} middleNameDraft={middleNameDraft} lastNameDraft={lastNameDraft} secondLastNameDraft={secondLastNameDraft} locationDraft={locationDraft} contactPhoneDraft={contactPhoneDraft} secondContactPhoneDraft={secondContactPhoneDraft} bioDraft={bioDraft} avatarDraft={avatarDraft} coverImageDraft={coverImageDraft} socialLinksDraft={socialLinksDraft} profileVisibilityDraft={profileVisibilityDraft} socialPrivacyDraft={socialPrivacyDraft} profileError={profileError} isSavingProfile={isSavingProfile} onEditProfile={beginProfileEdit} onNicknameDraftChange={setNicknameDraft} onFirstNameDraftChange={setFirstNameDraft} onMiddleNameDraftChange={setMiddleNameDraft} onLastNameDraftChange={setLastNameDraft} onSecondLastNameDraftChange={setSecondLastNameDraft} onLocationDraftChange={setLocationDraft} onContactPhoneDraftChange={setContactPhoneDraft} onSecondContactPhoneDraftChange={setSecondContactPhoneDraft} onBioDraftChange={setBioDraft} onSocialLinksDraftChange={setSocialLinksDraft} onProfileVisibilityDraftChange={setProfileVisibilityDraft} onSocialPrivacyDraftChange={setSocialPrivacyDraft} onImageChange={changeProfileImage} onSaveProfile={saveProfile} onCancelProfile={cancelProfileEdit} isCrewInvitationPending={crewInvitations.some((invitation) => invitation.from.handle === currentUser.handle && invitation.to.handle === profile.handle && invitation.status === 'pending')} isBandAdmin={Boolean(band && profile.handle === band.adminHandle)} onToggleCrew={() => toggleCrew(profile)} onPromote={() => setProfileBoostTarget(profile)} onReportProfile={() => void reportProfile(profile)} postCount={posts.filter((post) => post.author.handle === profile.handle).length} />}
+          {view === 'profile' && <nav className="profile-content-tabs" aria-label="Zawartość profilu">
+            <button type="button" className={profileTab === 'posts' ? 'active' : ''} onClick={() => setProfileTab('posts')}>Posty</button>
+            <button type="button" className={profileTab === 'gallery' ? 'active' : ''} onClick={() => setProfileTab('gallery')}>Galeria</button>
+          </nav>}
+          {view === 'profile' && profileTab === 'gallery' && <ProfileGallery
+            person={profile}
+            isOwn={profile.handle === currentUser.handle}
+            onPostPhotoDeleted={(postId) => setPosts((current) => current.flatMap((post) => {
+              if (post.id !== Number(postId)) return [post]
+              return post.text || post.video || post.externalUrl || post.sharedFrom ? [{ ...post, image: undefined }] : []
+            }))}
+          />}
 
-          {showPostFeed && <div className="feed-label">
+          {showPostFeed && showProfilePosts && <div className="feed-label">
             <span>{view === 'topiki' ? 'FILMY SPOŁECZNOŚCI' : view === 'saved' ? 'KOLEKCJA' : view === 'profile' ? 'POSTY' : view === 'explore' ? 'NA TEMAT' : isBandView ? 'ZAMKNIĘTA TABLICA BANDY' : view === 'home' ? 'OD EKIPY I POLECONE POSTY' : view === 'crew' ? 'POSTY Z TWOJEJ EKIPY' : 'POSTY Z TABLICY'}</span>
             {view !== 'topiki' && <button>Wszystkie tematy <ChevronDown size={14} /></button>}
           </div>}
 
-          {showPostFeed && <div className={view === 'topiki' ? 'topiki-player-shell' : undefined} tabIndex={view === 'topiki' ? 0 : undefined} onKeyDown={(event) => {
+          {showPostFeed && showProfilePosts && <div className={view === 'topiki' ? 'topiki-player-shell' : undefined} tabIndex={view === 'topiki' ? 0 : undefined} onKeyDown={(event) => {
             if (event.target instanceof HTMLElement && event.target.closest('input, textarea, [contenteditable="true"]')) return
             if (view === 'topiki' && event.key === 'ArrowLeft') { event.preventDefault(); navigateTopiki(-1) }
             if (view === 'topiki' && event.key === 'ArrowRight') { event.preventDefault(); navigateTopiki(1) }
@@ -2271,13 +2603,19 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
               <button type="button" onClick={() => navigateTopiki(1)} disabled={activeTopikiIndex >= filteredPosts.length - 1} aria-label="Następny Topik" title="Następny"><ChevronRight size={21} /></button>
             </div>}
             <div className={`post-list ${view === 'topiki' ? 'topiki-player-feed' : ''}`} ref={view === 'topiki' ? topikiFeedRef : undefined} tabIndex={view === 'topiki' ? 0 : undefined} aria-label={view === 'topiki' ? 'Odtwarzacz Topików' : undefined}>
+            {isPostFeedView && postsLoading && <div className="feed-status" role="status"><span className="feed-status-spinner" />Ładowanie wpisów z serwera…</div>}
+            {isPostFeedView && !postsLoading && postsError && <div className="feed-status feed-status-error" role="alert">
+              <strong>Nie udało się pobrać tablicy</strong>
+              <p>{postsError}</p>
+              <button className="empty-state-action" type="button" onClick={() => setPostsRetryKey((key) => key + 1)}>Spróbuj ponownie</button>
+            </div>}
             {filteredPosts.map((post, index) => (
               <Fragment key={post.id}>
               <article className={`post-card ${view === 'topiki' ? 'topiki-player-card' : ''}`} id={`post-${post.id}`} data-topiki-index={view === 'topiki' ? index : undefined}>
                 <div className="post-header">
                   <button className="post-author" onClick={() => openProfile(post.author)}>
                     <img src={post.author.avatar} alt="" />
-                    <span><strong>{post.author.name}{post.author.profileVerified && <BadgeCheck className="verified-profile-badge" size={14} aria-label="Zweryfikowany profil" />}{band && post.bandId === band.id && post.author.handle === band.adminHandle && <span className="admin-badge">Admin</span>}</strong><small>@{post.author.handle} <i>·</i> {post.time}</small></span>
+                    <span><strong>{post.author.name}{post.author.profileVerified && <BadgeCheck className="verified-profile-badge" size={14} aria-label="Zweryfikowany profil" />}{band && post.bandId === band.id && post.author.handle === band.adminHandle && <span className="admin-badge">Admin</span>}</strong><small>@{post.author.handle} <i>·</i> {formatPostTime(post.createdAt)}</small></span>
                   </button>
                   {post.author.id && post.author.id !== currentUser.id
                     ? <button className="post-menu" aria-label="Zgłoś post" title="Zgłoś post" onClick={() => void reportContent('post', `post:${post.id}`, post.author, post.text)}><Flag size={18} /></button>
@@ -2287,12 +2625,12 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
                 {post.sharedFrom && <div className="band-shared-origin">Udostępniono z Tablicy: <strong>{post.sharedFrom.author.name}</strong><span>#{post.sharedFrom.topic}</span></div>}
                 {post.profileTarget && <button className="promoted-profile-card" onClick={() => openProfile(post.profileTarget!)}><img src={post.profileTarget.avatar} alt="" /><span><small>POLECANY PROFIL</small><strong>{post.profileTarget.name}</strong><small>@{post.profileTarget.handle}</small></span><ArrowUp size={16} /></button>}
                 {post.text && (view === 'topiki' ? <TopikiDescription text={post.text} /> : <p className="post-copy">{post.text}</p>)}
-                {post.image && !moderatedItems.some((item) => item.targetType === 'photo' && item.targetId === `photo:${post.id}` && item.targetUserId === post.author.id) && <><img className="post-image" src={post.image} alt="Zdjęcie dołączone do posta" />{post.author.id && post.author.id !== currentUser.id && <button className="media-report-button" type="button" onClick={() => void reportContent('photo', `photo:${post.id}`, post.author, post.text, post.image)}>Zgłoś zdjęcie</button>}</>}
+                {post.image && !moderatedItems.some((item) => item.targetType === 'photo' && item.targetId === `photo:${post.id}` && item.targetUserId === post.author.id) && <><img className="post-image" src={post.image} alt="Zdjęcie dołączone do posta" loading="lazy" decoding="async" />{post.author.id && post.author.id !== currentUser.id && <button className="media-report-button" type="button" onClick={() => void reportContent('photo', `photo:${post.id}`, post.author, post.text, post.image)}>Zgłoś zdjęcie</button>}</>}
                 {post.video && !moderatedItems.some((item) => item.targetType === 'video' && item.targetId === `video:${post.id}` && item.targetUserId === post.author.id) && <>{view === 'topiki'
                   ? <TopikiVideo src={post.video} autoAdvance={autoAdvanceTopiki} onAutoAdvanceChange={setAutoAdvanceTopiki} onEnded={() => navigateTopiki(1)} />
                   : view === 'home' && homeTab === 'board'
                     ? <button type="button" className="topiki-feed-preview" onClick={() => openTopikiFromPost(post.id)} aria-label={`Otwórz Topik autora ${post.author.name}`}><video src={post.video} muted playsInline preload="metadata" /><span><Play size={18} fill="currentColor" />Oglądaj Topik</span></button>
-                    : <video className="post-image" src={post.video} controls playsInline />}{post.author.id && post.author.id !== currentUser.id && <button className="media-report-button" type="button" onClick={() => void reportContent('video', `video:${post.id}`, post.author, post.text, post.video)}>Zgłoś wideo</button>}</>}
+                    : <video className="post-image" src={post.video} controls playsInline preload="none" />}{post.author.id && post.author.id !== currentUser.id && <button className="media-report-button" type="button" onClick={() => void reportContent('video', `video:${post.id}`, post.author, post.text, post.video)}>Zgłoś wideo</button>}</>}
                 {post.externalUrl && <a className="post-external-link" href={post.externalUrl} target="_blank" rel="noreferrer"><span>LINK ZEWNĘTRZNY</span><strong>{post.externalUrl}</strong></a>}
                 <div className="post-stats"><button onClick={() => toggleComments(post.id)}>{post.comments.length} komentarze</button><span>{boostLabel(post.boosts)}</span></div>
                 {isBandView && <div className="post-read-receipts">
@@ -2344,27 +2682,26 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
               </>}
               </Fragment>
             ))}
-            {filteredPosts.length === 0 && !(view === 'home' && homeTab === 'board' && proposedTopiki.length > 0) && <div className="empty-state">
+            {isPostFeedView && !postsLoading && !postsError && filteredPosts.length === 0 && !(view === 'home' && homeTab === 'board' && proposedTopiki.length > 0) && <div className="empty-state">
               <span>{view === 'topiki' ? <Clapperboard size={22} /> : view === 'saved' ? <Bookmark size={22} /> : <Compass size={22} />}</span>
-              <strong>{view === 'topiki' ? 'Topiki czekają na pierwszy film' : view === 'saved' ? 'Tu będą Twoje zapisane posty' : isBandView ? 'Banda czeka na pierwszy post' : view === 'home' && homeTab === 'board' && feedMode === 'following' ? followedTopics.length ? 'Na razie nie ma nowych postów' : 'Wybierz tematy, które Cię ciekawią' : view === 'explore' && selectedTopic ? 'Ten temat czeka na rozmowę' : 'Nie znaleźliśmy postów'}</strong>
-              <p>{view === 'topiki' ? 'Krótkie filmy opublikowane na Tablicy pojawią się tutaj.' : view === 'saved' ? 'Zapisz post, żeby wrócić do niego później.' : isBandView ? 'Dodaj temat, zdjęcie lub krótki film tylko dla członków bandy.' : view === 'home' && homeTab === 'board' && feedMode === 'following' ? followedTopics.length ? 'Gdy pojawią się nowe posty w obserwowanych tematach, zobaczysz je tutaj.' : 'Odwiedź Odkrywanie i zacznij obserwować wybrane tematy.' : view === 'explore' && selectedTopic ? 'Możesz być pierwszą osobą, która rozpocznie rozmowę na ten temat.' : 'Spróbuj innego hasła albo wróć na tablicę.'}</p>
+              <strong>{view === 'topiki' ? 'Topiki czekają na pierwszy film' : view === 'saved' ? 'Tu będą Twoje zapisane posty' : isBandView ? 'Banda czeka na pierwszy post' : view === 'home' && homeTab === 'board' && feedMode === 'following' ? followedTopics.length ? 'Na razie nie ma nowych postów' : 'Wybierz tematy, które Cię ciekawią' : view === 'home' && homeTab === 'board' ? 'Tablica czeka na pierwszy post' : view === 'explore' && selectedTopic ? 'Ten temat czeka na rozmowę' : 'Nie znaleźliśmy postów'}</strong>
+              <p>{view === 'topiki' ? 'Krótkie filmy opublikowane na Tablicy pojawią się tutaj.' : view === 'saved' ? 'Zapisz post, żeby wrócić do niego później.' : isBandView ? 'Dodaj temat, zdjęcie lub krótki film tylko dla członków bandy.' : view === 'home' && homeTab === 'board' && feedMode === 'following' ? followedTopics.length ? 'Gdy pojawią się nowe posty w obserwowanych tematach, zobaczysz je tutaj.' : 'Odwiedź Odkrywanie i zacznij obserwować wybrane tematy.' : view === 'home' && homeTab === 'board' ? 'Wpisy pojawią się tutaj, gdy Ty lub osoby z Twojej Ekipy coś opublikujecie.' : view === 'explore' && selectedTopic ? 'Możesz być pierwszą osobą, która rozpocznie rozmowę na ten temat.' : 'Spróbuj innego hasła albo wróć na tablicę.'}</p>
               {view === 'home' && homeTab === 'board' && feedMode === 'following' && <button className="empty-state-action" onClick={() => showView('explore')}>Odkrywaj tematy</button>}
             </div>}
-            {view === 'home' && homeTab === 'board' && filteredPosts.length === 0 && <>
+            {view === 'home' && homeTab === 'board' && !postsLoading && !postsError && filteredPosts.length === 0 && <>
               <SuggestedProfiles people={suggestedProfiles} boostCounts={profileBoostCounts} onOpen={openProfile} onAdd={sendCrewInvitation} onDismiss={dismissSuggestedProfile} />
               <SuggestedTopiki posts={proposedTopiki} onOpen={openTopikiFromPost} />
               {feedMode === 'following' && followedTopics.length === 0 && <TopicDiscoveryPanel topics={topicCatalog} followedTopics={followedTopics} onOpen={openTopic} onToggleFollow={toggleFollowTopic} />}
             </>}
+            {hasMorePosts && <div className="feed-page-sentinel" ref={feedSentinelRef} aria-hidden="true" />}
+            {loadingMorePosts && <div className="feed-status" role="status"><span className="feed-status-spinner" />Ładowanie kolejnych wpisów…</div>}
+            {postsPageError && <div className="feed-status feed-status-error" role="alert"><p>{postsPageError}</p><button className="empty-state-action" type="button" onClick={() => setPostsPageError('')}>Spróbuj ponownie</button></div>}
             </div>
             {view === 'topiki' && <span className="topiki-player-spacer" aria-hidden="true" />}
           </div>}
         </main>
 
         <aside className="right-rail">
-          <section className="right-section birthdays">
-            <div className="right-title"><h2>Miło dziś świętować</h2><span className="confetti">✳</span></div>
-            <div className="birthday-card"><span className="birthday-icon">✦</span><p><strong>Lena Wójcik</strong><small>ma dzisiaj urodziny</small></p><button aria-label="Złóż życzenia"><Send size={15} /></button></div>
-          </section>
           <section className="right-section online-section">
             <div className="right-title"><h2>Ekipa</h2><button onClick={() => showView('crew')}>Zobacz ekipę</button></div>
             {allUsers.filter((person) => person.online && crewHandles.includes(person.handle)).map((person) => <button className="online-person" key={person.handle} onClick={() => openProfile(person)}><span className="online-avatar"><img src={person.avatar} alt="" /><i /></span><span>{person.name}</span><small>{presenceLabel(person)}</small></button>)}
@@ -2437,6 +2774,28 @@ function SocialApp({ currentUser, onCurrentUserUpdate, onLogout }: { currentUser
           <button className="profile-share-choice" onClick={() => boostProfileOnBoard(profileBoostTarget)}><ArrowUp size={17} /><span><strong>Podbij na tablicy</strong><small>Udostępnij polecenie ekipowiczom</small></span></button>
         </section>
       </div>}
+      {reportDraft && <div className="report-backdrop" onClick={() => setReportDraft(null)}>
+        <section className="report-dialog" role="dialog" aria-modal="true" aria-labelledby="report-dialog-title" onClick={(event) => event.stopPropagation()}>
+          <header>
+            <div>
+              <strong id="report-dialog-title">Zgłoś {reportTypeName(reportDraft.targetType)}</strong>
+              <small>{reportDraft.targetName}</small>
+            </div>
+            <button type="button" onClick={() => setReportDraft(null)} aria-label="Zamknij zgłoszenie"><X size={18} /></button>
+          </header>
+          <div className="report-category-grid">
+            {reportCategoryOptions.map((option) => <button key={option.id} type="button" className={`report-category-option ${reportDraft.reasonCategory === option.id ? 'active' : ''}`} onClick={() => setReportDraft((current) => current ? { ...current, reasonCategory: option.id } : current)}>{option.label}</button>)}
+          </div>
+          <label className="report-field">
+            <span>Co jest niepokojące?</span>
+            <textarea value={reportDraft.reason} onChange={(event) => setReportDraft((current) => current ? { ...current, reason: event.target.value.slice(0, 500) } : current)} placeholder="Napisz krótkie spostrzeżenie dla moderatora..." rows={4} maxLength={500} />
+          </label>
+          <footer className="report-dialog-footer">
+            <button type="button" className="secondary-button" onClick={() => setReportDraft(null)}>Anuluj</button>
+            <button type="button" className="primary-button" onClick={() => void submitReportDraft()}>Wyślij zgłoszenie</button>
+          </footer>
+        </section>
+      </div>}
       {notice && <div className="toast"><Check size={16} />{notice}</div>}
       <nav className="mobile-nav" aria-label="Menu mobilne">{navItems.map(({ id, icon: Icon, label }) => <button key={id} className={view === id ? 'active' : ''} onClick={() => showView(id)} aria-label={label}><Icon size={20} />{id === 'band' && unreadBandCount > 0 && <span className="mobile-nav-count">{unreadBandCount > 9 ? '9+' : unreadBandCount}</span>}</button>)}</nav>
     </div>
@@ -2507,6 +2866,7 @@ function AuthScreen({ onAuthenticated }: { onAuthenticated: (user: Person) => vo
   const [birthYear, setBirthYear] = useState('')
   const [email, setEmail] = useState('')
   const [phone, setPhone] = useState('')
+  const [phoneCountry, setPhoneCountry] = useState('PL')
   const [password, setPassword] = useState('')
   const [confirmPassword, setConfirmPassword] = useState('')
   const [rememberMe, setRememberMe] = useState(false)
@@ -2592,7 +2952,13 @@ function AuthScreen({ onAuthenticated }: { onAuthenticated: (user: Person) => vo
         let age = today.getFullYear() - birthday.getFullYear()
         if (today.getMonth() < birthday.getMonth() || (today.getMonth() === birthday.getMonth() && today.getDate() < birthday.getDate())) age -= 1
         if (age < 15) throw new Error('Konto YouTopic mogą założyć osoby, które ukończyły 15 lat.')
-        const result = await authRequest<{ message: string }>('/api/auth/register', { firstName, lastName, gender, birthDate, email, phone, password, confirmPassword })
+        const dialCode = phoneDialCodes.find((country) => country.country === phoneCountry)?.dialCode
+        const nationalNumber = phone.replace(/\D/g, '').replace(/^0+/, '')
+        const internationalPhone = dialCode ? `${dialCode}${nationalNumber}` : ''
+        if (!/^\+[1-9]\d{7,14}$/.test(internationalPhone)) {
+          throw new Error('Podaj prawidłowy numer krajowy i wybierz właściwy prefiks kraju.')
+        }
+        const result = await authRequest<{ message: string }>('/api/auth/register', { firstName, lastName, gender, birthDate, email, phone: internationalPhone, password, confirmPassword })
         setPendingEmail(email)
         setMessage(result.message)
         setMode('verify-email')
@@ -2667,7 +3033,8 @@ function AuthScreen({ onAuthenticated }: { onAuthenticated: (user: Person) => vo
               <fieldset className="auth-gender-fields"><legend>Płeć</legend>{([['female', 'Kobieta'], ['male', 'Mężczyzna'], ['other', 'Inna'], ['undisclosed', 'Wolę nie podawać']] as const).map(([value, label], index) => <label key={value}><input type="radio" name="gender" value={value} checked={gender === value} onChange={() => setGender(value)} required={index === 0} /><span>{label}</span></label>)}</fieldset>
               <fieldset className="auth-birth-fields"><legend>Data urodzenia <span>Musisz mieć co najmniej 15 lat</span></legend><input aria-label="Dzień urodzenia" type="number" min="1" max="31" placeholder="DD" value={birthDay} onChange={(event) => setBirthDay(event.target.value)} required /><select aria-label="Miesiąc urodzenia" value={birthMonth} onChange={(event) => setBirthMonth(event.target.value)} required><option value="">MM</option>{['styczeń', 'luty', 'marzec', 'kwiecień', 'maj', 'czerwiec', 'lipiec', 'sierpień', 'wrzesień', 'październik', 'listopad', 'grudzień'].map((month, index) => <option value={String(index + 1)} key={month}>{month}</option>)}</select><input aria-label="Rok urodzenia" type="number" min="1900" max={new Date().getFullYear()} placeholder="RRRR" value={birthYear} onChange={(event) => setBirthYear(event.target.value)} required /></fieldset>
               <label>Adres e-mail<input autoComplete="email" type="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="anna@example.com" required /></label>
-              <label>Numer telefonu<input autoComplete="tel" type="tel" value={phone} onChange={(event) => setPhone(event.target.value)} placeholder="+48123456789" pattern="\+[1-9][0-9]{7,14}" title="Użyj formatu międzynarodowego, np. +48123456789" required /></label>
+              <div className="auth-phone-fields"><label>Kraj<select autoComplete="country" value={phoneCountry} onChange={(event) => setPhoneCountry(event.target.value)} required>{phoneDialCodes.map((country) => <option key={country.country} value={country.country}>{country.label}</option>)}</select></label><label>Numer telefonu<input autoComplete="tel-national" inputMode="tel" type="tel" value={phone} onChange={(event) => setPhone(event.target.value)} placeholder="123 456 789" maxLength={20} aria-describedby="registration-phone-hint" required /></label></div>
+              <small id="registration-phone-hint" className="auth-phone-hint">Wpisz numer bez prefiksu kraju. Prefiks zostanie dodany automatycznie.</small>
               <div className="auth-name-fields"><label>Hasło<input autoComplete="new-password" type="password" minLength={7} value={password} onChange={(event) => setPassword(event.target.value)} required /></label><label>Powtórz hasło<input autoComplete="new-password" type="password" minLength={7} value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} required /></label></div>
               <button className="auth-submit" type="submit" disabled={busy}>{busy ? 'Wysyłanie...' : 'Zarejestruj się'}<span>→</span></button>
             </> : <>
@@ -2954,10 +3321,12 @@ function SuggestedProfiles({ people, boostCounts, onOpen, onAdd, onDismiss }: { 
   </section>
 }
 
-function ProfileHeader({ person, isOwn, isCrewMember, isEditingProfile, nicknameDraft, firstNameDraft, middleNameDraft, lastNameDraft, secondLastNameDraft, locationDraft, contactPhoneDraft, secondContactPhoneDraft, bioDraft, avatarDraft, coverImageDraft, socialLinksDraft, profileVisibilityDraft, profileError, isSavingProfile, onEditProfile, onNicknameDraftChange, onFirstNameDraftChange, onMiddleNameDraftChange, onLastNameDraftChange, onSecondLastNameDraftChange, onLocationDraftChange, onContactPhoneDraftChange, onSecondContactPhoneDraftChange, onBioDraftChange, onSocialLinksDraftChange, onProfileVisibilityDraftChange, onImageChange, onSaveProfile, onCancelProfile, isCrewInvitationPending, isBandAdmin, onToggleCrew, onPromote, onReportProfile, postCount }: {
+function ProfileHeader({ person, isOwn, isCrewMember, isBlocked, blockedPeople, isEditingProfile, nicknameDraft, firstNameDraft, middleNameDraft, lastNameDraft, secondLastNameDraft, locationDraft, contactPhoneDraft, secondContactPhoneDraft, bioDraft, avatarDraft, coverImageDraft, socialLinksDraft, profileVisibilityDraft, socialPrivacyDraft, profileError, isSavingProfile, onEditProfile, onNicknameDraftChange, onFirstNameDraftChange, onMiddleNameDraftChange, onLastNameDraftChange, onSecondLastNameDraftChange, onLocationDraftChange, onContactPhoneDraftChange, onSecondContactPhoneDraftChange, onBioDraftChange, onSocialLinksDraftChange, onProfileVisibilityDraftChange, onSocialPrivacyDraftChange, onImageChange, onSaveProfile, onCancelProfile, isCrewInvitationPending, isBandAdmin, onToggleCrew, onToggleBlock, onPromote, onReportProfile, postCount }: {
   person: Person
   isOwn: boolean
   isCrewMember: boolean
+  isBlocked: boolean
+  blockedPeople: Person[]
   isEditingProfile: boolean
   nicknameDraft: string
   firstNameDraft: string
@@ -2972,6 +3341,7 @@ function ProfileHeader({ person, isOwn, isCrewMember, isEditingProfile, nickname
   coverImageDraft: string
   socialLinksDraft: SocialProfileLink[]
   profileVisibilityDraft: ProfileVisibilitySettings
+  socialPrivacyDraft: SocialPrivacy
   profileError: string
   isSavingProfile: boolean
   onEditProfile: () => void
@@ -2986,24 +3356,26 @@ function ProfileHeader({ person, isOwn, isCrewMember, isEditingProfile, nickname
   onBioDraftChange: (bio: string) => void
   onSocialLinksDraftChange: (links: SocialProfileLink[]) => void
   onProfileVisibilityDraftChange: (visibility: ProfileVisibilitySettings) => void
+  onSocialPrivacyDraftChange: (privacy: SocialPrivacy) => void
   onImageChange: (kind: 'avatar' | 'cover', file: File) => Promise<void>
   onSaveProfile: (event: FormEvent<HTMLFormElement>) => void
   onCancelProfile: () => void
   isCrewInvitationPending: boolean
   isBandAdmin: boolean
   onToggleCrew: () => void
+  onToggleBlock: (person: Person) => void
   onPromote: () => void
   onReportProfile: () => void
   postCount: number
 }) {
-  const memberCount = person.crewMembers + Number(isCrewMember)
+  const memberCount = person.crewMembers
   const visibility = { ...defaultProfileVisibility, ...person.profileVisibility, contactPhone: person.profileVisibility?.contactPhone ?? 'private', secondContactPhone: person.profileVisibility?.secondContactPhone ?? 'private' }
   const canView = (audience: ProfileAudience) => isOwn || audience === 'public' || (audience === 'crew' && isCrewMember)
   const cover = isEditingProfile && isOwn ? coverImageDraft : person.coverImage
   const avatar = isEditingProfile && isOwn ? avatarDraft : person.avatar
   return <section className="profile-header">
     <div className="profile-cover" style={cover ? { backgroundImage: `linear-gradient(90deg, #18372655, #18372622), url("${cover}")` } : undefined}>{!cover && <span>YT</span>}{isOwn && isEditingProfile && <label className="profile-cover-upload">Zmień zdjęcie w tle<input type="file" accept="image/*" onChange={(event) => { const file = event.currentTarget.files?.[0]; if (file) void onImageChange('cover', file); event.currentTarget.value = '' }} /></label>}</div>
-    <div className="profile-details"><div className="profile-avatar-wrap"><img src={avatar} alt={person.name} />{isOwn && isEditingProfile && <label className="profile-avatar-upload">Zmień zdjęcie<input type="file" accept="image/*" onChange={(event) => { const file = event.currentTarget.files?.[0]; if (file) void onImageChange('avatar', file); event.currentTarget.value = '' }} /></label>}</div><div className="profile-buttons">{isOwn ? <button className="edit-profile" type="button" onClick={isEditingProfile ? onCancelProfile : onEditProfile}><Settings2 size={15} /> {isEditingProfile ? 'Anuluj edycję' : 'Edytuj profil'}</button> : <><button className={`follow-button ${isCrewMember ? 'following' : ''} ${isCrewInvitationPending ? 'invite-pending' : ''}`} onClick={onToggleCrew}>{isCrewMember ? <><X size={14} /> Usuń z Ekipy</> : isCrewInvitationPending ? <><X size={14} /> Anuluj zaproszenie</> : <><Plus size={14} /> Dodaj do Ekipy</>}</button><button className="promote-profile-button" onClick={onPromote}><ArrowUp size={14} /> Podbij profil</button></>}<button className="profile-more" type="button" onClick={person.id && !isOwn ? onReportProfile : undefined} aria-label={person.id && !isOwn ? 'Zgłoś profil' : 'Więcej'} title={person.id && !isOwn ? 'Zgłoś profil' : 'Więcej'}>{person.id && !isOwn ? <Flag size={18} /> : <MoreHorizontal size={20} />}</button></div>
+    <div className="profile-details"><div className="profile-avatar-wrap"><img src={avatar} alt={person.name} />{isOwn && isEditingProfile && <label className="profile-avatar-upload">Zmień zdjęcie<input type="file" accept="image/*" onChange={(event) => { const file = event.currentTarget.files?.[0]; if (file) void onImageChange('avatar', file); event.currentTarget.value = '' }} /></label>}</div><div className="profile-buttons">{isOwn ? <button className="edit-profile" type="button" onClick={isEditingProfile ? onCancelProfile : onEditProfile}><Settings2 size={15} /> {isEditingProfile ? 'Anuluj edycję' : 'Edytuj profil'}</button> : <button className="profile-block-button" type="button" onClick={() => onToggleBlock(person)}>{isBlocked ? 'Odblokuj' : 'Zablokuj'}</button>}<button className="profile-more" type="button" onClick={person.id && !isOwn ? onReportProfile : undefined} aria-label={person.id && !isOwn ? 'Zgłoś profil' : 'Więcej'} title={person.id && !isOwn ? 'Zgłoś profil' : 'Więcej'}>{person.id && !isOwn ? <Flag size={18} /> : <MoreHorizontal size={20} />}</button></div>
       <h2>{person.name}{person.profileVerified && <BadgeCheck className="verified-profile-badge" size={18} aria-label="Zweryfikowany profil" />}{isBandAdmin && <span className="admin-badge">Admin</span>}</h2><p className="profile-handle">@{person.nickname ?? person.handle}</p>
       {isOwn && isEditingProfile && <form className="profile-editor" onSubmit={onSaveProfile}>
         <div className="profile-name-fields">
@@ -3024,14 +3396,16 @@ function ProfileHeader({ person, isOwn, isCrewMember, isEditingProfile, nickname
         </div>)}{socialLinksDraft.length < socialPlatforms.length && <button className="profile-add-social" type="button" onClick={() => onSocialLinksDraftChange([...socialLinksDraft, { id: Math.max(0, ...socialLinksDraft.map((link) => link.id)) + 1, platform: socialPlatforms.find((platform) => !socialLinksDraft.some((link) => link.platform === platform)) ?? socialPlatforms[0], url: '' }])}><Plus size={14} /> Dodaj link</button>}</fieldset>
         <fieldset className="profile-visibility-editor"><legend>Widoczność danych profilu</legend>
           <p>Imię, nazwisko, nick, zdjęcie profilowe i zdjęcie w tle są zawsze publiczne.</p>
+          <label className="profile-privacy-select">Kto może znaleźć i zobaczyć profil<select value={socialPrivacyDraft.profileAudience} onChange={(event) => onSocialPrivacyDraftChange({ ...socialPrivacyDraft, profileAudience: event.target.value as ProfileAudience })}><option value="public">Wszyscy</option><option value="crew">Tylko osoby z Ekipy</option><option value="private">Tylko ja</option></select></label>
+          <label className="profile-privacy-select">Kto może wysłać zaproszenie do Ekipy<select value={socialPrivacyDraft.crewInviteAudience} onChange={(event) => onSocialPrivacyDraftChange({ ...socialPrivacyDraft, crewInviteAudience: event.target.value as SocialPrivacy['crewInviteAudience'] })}><option value="everyone">Wszyscy</option><option value="nobody">Nikt</option></select></label>
           <VisibilityPicker label="Miejscowość" value={profileVisibilityDraft.location} onChange={(value) => onProfileVisibilityDraftChange({ ...profileVisibilityDraft, location: value })} />
           <VisibilityPicker label="Biografia" value={profileVisibilityDraft.bio} onChange={(value) => onProfileVisibilityDraftChange({ ...profileVisibilityDraft, bio: value })} />
           <VisibilityPicker label="Telefon kontaktowy" value={profileVisibilityDraft.contactPhone} onChange={(value) => onProfileVisibilityDraftChange({ ...profileVisibilityDraft, contactPhone: value })} />
           <VisibilityPicker label="Drugi numer telefonu" value={profileVisibilityDraft.secondContactPhone} onChange={(value) => onProfileVisibilityDraftChange({ ...profileVisibilityDraft, secondContactPhone: value })} />
           <VisibilityPicker label="Media społecznościowe" value={profileVisibilityDraft.socialLinks} onChange={(value) => onProfileVisibilityDraftChange({ ...profileVisibilityDraft, socialLinks: value })} />
-          <VisibilityPicker label="Liczba Ekipowiczów" value={profileVisibilityDraft.crewMembers} onChange={(value) => onProfileVisibilityDraftChange({ ...profileVisibilityDraft, crewMembers: value })} />
-          <VisibilityPicker label="Liczba osób w Ekipie" value={profileVisibilityDraft.crewSize} onChange={(value) => onProfileVisibilityDraftChange({ ...profileVisibilityDraft, crewSize: value })} />
+          <VisibilityPicker label="Liczba osób w Ekipie" value={profileVisibilityDraft.crewMembers} onChange={(value) => onProfileVisibilityDraftChange({ ...profileVisibilityDraft, crewMembers: value, crewSize: value })} />
         </fieldset>
+        {blockedPeople.length > 0 && <section className="blocked-people-editor"><strong>Zablokowane konta</strong>{blockedPeople.map((blocked) => <div key={blocked.id}><span>@{blocked.nickname ?? blocked.handle}</span><button type="button" onClick={() => onToggleBlock(blocked)}>Odblokuj</button></div>)}</section>}
         {profileError && <p className="profile-editor-error" role="alert">{profileError}</p>}
         <div className="profile-editor-actions"><button type="button" onClick={onCancelProfile}>Anuluj</button><button type="submit" disabled={isSavingProfile}>{isSavingProfile ? 'Zapisywanie…' : 'Zapisz profil'}</button></div>
       </form>}
@@ -3043,8 +3417,197 @@ function ProfileHeader({ person, isOwn, isCrewMember, isEditingProfile, nickname
         {canView(visibility.bio) && (person.bio ? <p className="profile-bio">{person.bio}</p> : !isOwn && <p className="profile-bio">Ciekawość świata, dobre jedzenie i wszystkie odcienie codzienności.</p>)}
         {canView(visibility.socialLinks) && person.socialLinks && Object.entries(person.socialLinks).some(([, url]) => Boolean(url)) && <nav className="profile-social-links" aria-label="Media społecznościowe">{Object.entries(person.socialLinks).filter((entry): entry is [SocialPlatform, string] => Boolean(entry[1])).map(([platform, url]) => <a href={url} key={platform} target="_blank" rel="noreferrer">{platform}<span aria-hidden="true">↗</span></a>)}</nav>}
       </>}
-      <div className="profile-counts"><span><strong>{postCount}</strong> posty</span>{canView(visibility.crewMembers) && <span><strong>{memberCount}</strong> Ekipowiczów</span>}{canView(visibility.crewSize) && <span><strong>{person.crewSize}</strong> w Ekipie</span>}</div>
+      <div className="profile-counts"><span><strong>{postCount}</strong> posty</span>{canView(visibility.crewMembers) && <span><strong>{memberCount}</strong> osób w Ekipie</span>}</div>
+      {!isOwn && <div className="profile-relationship-actions">
+        {isCrewMember
+          ? <span className="profile-crew-state"><Check size={15} /> W Ekipie</span>
+          : isCrewInvitationPending
+            ? <><span className="profile-invitation-sent"><Check size={14} /> Wysłano</span><button className="profile-invitation-cancel" type="button" onClick={onToggleCrew}>Anuluj</button></>
+            : <button className="profile-add-crew" type="button" disabled={isBlocked} onClick={onToggleCrew}><Plus size={15} /> Dodaj do Ekipy</button>}
+        {!isBlocked && <button className="promote-profile-button" type="button" onClick={onPromote}><ArrowUp size={15} /> Podbij profil</button>}
+      </div>}
     </div>
+  </section>
+}
+
+function ProfileGallery({ person, isOwn, onPostPhotoDeleted }: { person: Person; isOwn: boolean; onPostPhotoDeleted: (postId: string) => void }) {
+  const galleryRequestId = useRef(0)
+  const [photos, setPhotos] = useState<GalleryPhoto[]>([])
+  const [albums, setAlbums] = useState<GalleryAlbum[]>([])
+  const [selectedAlbumId, setSelectedAlbumId] = useState('')
+  const [newAlbumName, setNewAlbumName] = useState('')
+  const [loading, setLoading] = useState(true)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const [success, setSuccess] = useState('')
+
+  async function loadGallery() {
+    const requestId = ++galleryRequestId.current
+    setLoading(true)
+    setError('')
+    try {
+      const result = await authRequest<{ photos: GalleryPhoto[]; albums: GalleryAlbum[] }>(`/api/gallery/${encodeURIComponent(person.handle)}`)
+      if (requestId !== galleryRequestId.current) return
+      setPhotos(result.photos)
+      setAlbums(result.albums)
+      setSelectedAlbumId((selected) => selected && result.albums.some((album) => album.id === selected) ? selected : '')
+    } catch (loadError) {
+      if (requestId !== galleryRequestId.current) return
+      setError(loadError instanceof Error ? loadError.message : 'Nie udało się wczytać galerii.')
+    } finally {
+      if (requestId === galleryRequestId.current) setLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    void loadGallery()
+    return () => { galleryRequestId.current += 1 }
+  }, [person.handle])
+
+  const activeAlbum = albums.find((album) => album.id === selectedAlbumId)
+  const allPhotos = [...photos, ...albums.flatMap((album) => album.photos
+    .filter((photo) => !photo.sourcePostId)
+    .map((photo) => ({ ...photo, albumId: album.id })))]
+  const visiblePhotos = activeAlbum
+    ? activeAlbum.photos.map((photo) => {
+      const source = photo.sourcePostId ? photos.find((item) => item.sourcePostId === photo.sourcePostId) : undefined
+      return { ...source, ...photo, albumId: activeAlbum.id }
+    })
+    : [...new Map(allPhotos.map((photo) => [photo.sourcePostId ? `post:${photo.sourcePostId}` : photo.mediaId ?? photo.id, photo])).values()]
+
+  async function createAlbum(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    setBusy(true)
+    setError('')
+    setSuccess('')
+    try {
+      const { album } = await authRequest<{ album: GalleryAlbum }>('/api/gallery/albums', { name: newAlbumName })
+      setAlbums((current) => [album, ...current])
+      setSelectedAlbumId(album.id)
+      setNewAlbumName('')
+      setSuccess('Album został utworzony.')
+    } catch (createError) {
+      setError(createError instanceof Error ? createError.message : 'Nie udało się utworzyć albumu.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function addPhotoToAlbum(photo: GalleryPhoto, albumId: string) {
+    if (!albumId) return
+    setBusy(true)
+    setError('')
+    setSuccess('')
+    try {
+      const result = await authRequest<{ album: GalleryAlbum }>(`/api/gallery/albums/${encodeURIComponent(albumId)}/photos`, { sourcePostId: photo.sourcePostId })
+      setAlbums((current) => current.map((album) => album.id === result.album.id ? result.album : album))
+      setSuccess('Zdjęcie dodano do albumu.')
+    } catch (addError) {
+      setError(addError instanceof Error ? addError.message : 'Nie udało się dodać zdjęcia do albumu.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function uploadPhoto(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.currentTarget.files?.[0]
+    event.currentTarget.value = ''
+    if (!file || !selectedAlbumId) return
+    setBusy(true)
+    setError('')
+    setSuccess('')
+    try {
+      const compressed = await resizeProfileImage(file, 1600)
+      const blob = await (await fetch(compressed)).blob()
+      const media = await uploadMedia(blob)
+      await authRequest(`/api/gallery/albums/${encodeURIComponent(selectedAlbumId)}/photos`, { mediaId: media.id })
+      await loadGallery()
+      setSuccess('Zdjęcie dodano do albumu.')
+    } catch (uploadError) {
+      setError(uploadError instanceof Error ? uploadError.message : 'Nie udało się dodać zdjęcia.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function removePhoto(photo: GalleryPhoto, fromAlbum = false) {
+    setBusy(true)
+    setError('')
+    setSuccess('')
+    try {
+      if (fromAlbum && activeAlbum) {
+        await authDelete(`/api/gallery/albums/${encodeURIComponent(activeAlbum.id)}/photos/${encodeURIComponent(photo.id)}`)
+      } else if (photo.sourcePostId) {
+        await authDelete(`/api/gallery/posts/${encodeURIComponent(photo.sourcePostId)}/photo`)
+        onPostPhotoDeleted(photo.sourcePostId)
+      } else if (photo.albumId) {
+        await authDelete(`/api/gallery/albums/${encodeURIComponent(photo.albumId)}/photos/${encodeURIComponent(photo.id)}`)
+      }
+      await loadGallery()
+      setSuccess(fromAlbum ? 'Zdjęcie usunięto z albumu.' : 'Zdjęcie zostało usunięte z galerii.')
+    } catch (removeError) {
+      setError(removeError instanceof Error ? removeError.message : 'Nie udało się usunąć zdjęcia.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function removeAlbum(album: GalleryAlbum) {
+    if (!window.confirm(`Usunąć album „${album.name}”? Zdjęcia źródłowe pozostaną na Tablicy.`)) return
+    setBusy(true)
+    setError('')
+    setSuccess('')
+    try {
+      await authDelete(`/api/gallery/albums/${encodeURIComponent(album.id)}`)
+      setAlbums((current) => current.filter((item) => item.id !== album.id))
+      setSelectedAlbumId('')
+      setSuccess('Album został usunięty. Zdjęcia z Tablicy pozostały bez zmian.')
+    } catch (removeError) {
+      setError(removeError instanceof Error ? removeError.message : 'Nie udało się usunąć albumu.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return <section className="profile-gallery" aria-label={`Galeria użytkownika ${person.handle}`}>
+    <header className="profile-gallery-heading">
+      <div><h3>{activeAlbum ? activeAlbum.name : 'Galeria zdjęć'}</h3><p>Zdjęcia z Tablicy i albumów użytkownika. Prywatne zdjęcia z Band i czatu nie są tu wyświetlane.</p></div>
+      <span>{topicCountLabel(visiblePhotos.length, ['zdjęcie', 'zdjęcia', 'zdjęć'])}</span>
+    </header>
+    {isOwn && <div className="profile-gallery-tools">
+      <form className="profile-gallery-create" onSubmit={(event) => void createAlbum(event)}>
+        <label htmlFor="profile-gallery-new-album">Nazwa nowego albumu</label>
+        <input id="profile-gallery-new-album" value={newAlbumName} onChange={(event) => setNewAlbumName(event.target.value)} maxLength={60} placeholder="np. Wakacje 2026" required />
+        <button type="submit" disabled={busy}><Plus size={15} /> Utwórz album</button>
+      </form>
+      {selectedAlbumId && <label className="profile-gallery-upload">Dodaj nowe zdjęcie<input type="file" accept="image/*" disabled={busy} onChange={(event) => void uploadPhoto(event)} /></label>}
+    </div>}
+    <nav className="profile-gallery-albums" aria-label="Albumy">
+      <button type="button" className={!selectedAlbumId ? 'active' : ''} onClick={() => setSelectedAlbumId('')}>Wszystkie zdjęcia</button>
+      {albums.map((album) => <span key={album.id}>
+        <button type="button" className={selectedAlbumId === album.id ? 'active' : ''} onClick={() => setSelectedAlbumId(album.id)}>{album.name} <small>{album.photos.length}</small></button>
+        {isOwn && selectedAlbumId === album.id && <button type="button" className="profile-gallery-delete-album" disabled={busy} onClick={() => void removeAlbum(album)} aria-label={`Usuń album ${album.name}`} title="Usuń album"><Trash2 size={14} /></button>}
+      </span>)}
+    </nav>
+    {error && <p className="profile-gallery-message error" role="alert">{error}</p>}
+    {success && <p className="profile-gallery-message success" role="status">{success}</p>}
+    {loading
+      ? <p className="profile-gallery-empty" role="status">Ładowanie galerii…</p>
+      : visiblePhotos.length === 0
+        ? <p className="profile-gallery-empty">{activeAlbum ? 'Ten album nie zawiera jeszcze zdjęć.' : 'Nie ma jeszcze zdjęć w galerii.'}</p>
+        : <div className="profile-gallery-grid">{visiblePhotos.map((photo) => <article className="profile-gallery-photo" key={`${photo.albumId ?? 'all'}:${photo.id}`}>
+          <img src={photo.url} alt={photo.caption || 'Zdjęcie z galerii'} loading="lazy" />
+          {photo.caption && <p>{photo.caption}</p>}
+          <small>{formatPostTime(photo.createdAt)}</small>
+          {isOwn && <div className="profile-gallery-photo-actions">
+            {!activeAlbum && photo.sourcePostId && albums.length > 0 && <select disabled={busy} defaultValue="" aria-label="Dodaj zdjęcie do albumu" onChange={(event) => { const albumId = event.target.value; event.target.value = ''; void addPhotoToAlbum(photo, albumId) }}>
+              <option value="" disabled>Dodaj do albumu</option>
+              {albums.map((album) => <option value={album.id} key={album.id} disabled={album.photos.some((item) => item.sourcePostId === photo.sourcePostId)}>{album.name}</option>)}
+            </select>}
+            {activeAlbum && <button type="button" disabled={busy} onClick={() => void removePhoto(photo, true)}>Usuń z albumu</button>}
+            {!activeAlbum && <button type="button" disabled={busy} onClick={() => void removePhoto(photo)}><Trash2 size={13} /> Usuń</button>}
+          </div>}
+        </article>)}</div>}
   </section>
 }
 

@@ -16,6 +16,7 @@ import {
   MessageCircle,
   Megaphone,
   Inbox,
+  Image,
   Pencil,
   Search,
   Send,
@@ -133,11 +134,35 @@ type AdminUser = {
   isAdmin: boolean
 }
 
+type AdminGalleryPhoto = {
+  id: string
+  url: string
+  caption: string
+  createdAt: number
+  sourcePostId?: string
+  mediaId?: string
+}
+
+type AdminGalleryAlbum = {
+  id: string
+  name: string
+  createdAt: number
+  photos: AdminGalleryPhoto[]
+}
+
+type AdminGalleryReview = {
+  user: AdminUser
+  photos: AdminGalleryPhoto[]
+  albums: AdminGalleryAlbum[]
+}
+
 type ProfileReport = {
   id: string
   reason: string
   createdAt: number
 }
+
+type ReportReasonCategory = 'terms_violation' | 'harassment' | 'hate' | 'violence' | 'spam' | 'privacy' | 'impersonation' | 'sexual_content' | 'other'
 
 type ModerationReport = {
   id: string
@@ -145,12 +170,15 @@ type ModerationReport = {
   targetId: string
   contentPreview: string
   contentUrl: string
+  reasonCategory: ReportReasonCategory
+  reasonCategoryLabel: string
   reason: string
   createdAt: number
   status: 'pending' | 'resolved'
   decision: 'dismiss' | 'remove_content' | 'warn' | 'block_account' | null
   decisionNote: string
   decidedAt: number | null
+  decidedBy?: string | null
   reporter: { id: string; name: string }
   target: { id: string; name: string; nickname: string }
 }
@@ -162,6 +190,18 @@ const reportTypeLabels: Record<ModerationReport['targetType'], string> = {
   video: 'Wideo',
   comment: 'Komentarz',
   message: 'Wiadomość',
+}
+
+const reportCategoryLabels: Record<ReportReasonCategory, string> = {
+  terms_violation: 'Naruszenie regulaminu',
+  harassment: 'Nękanie',
+  hate: 'Mowa nienawiści',
+  violence: 'Przemoc / groźby',
+  spam: 'Spam / oszustwo',
+  privacy: 'Naruszenie prywatności',
+  impersonation: 'Podszywanie się',
+  sexual_content: 'Treści seksualne',
+  other: 'Inne',
 }
 
 const reportDecisionLabels: Record<NonNullable<ModerationReport['decision']>, string> = {
@@ -295,6 +335,10 @@ function AdminApp() {
   const [reports, setReports] = useState<ModerationReport[]>([])
   const [reportStatusFilter, setReportStatusFilter] = useState<'pending' | 'resolved' | 'all'>('pending')
   const [reportTypeFilter, setReportTypeFilter] = useState<ModerationReport['targetType'] | 'all'>('all')
+  const [reportCategoryFilter, setReportCategoryFilter] = useState<ReportReasonCategory | 'all'>('all')
+  const [reportSearch, setReportSearch] = useState('')
+  const [reportFromDate, setReportFromDate] = useState('')
+  const [reportToDate, setReportToDate] = useState('')
   const [selectedReport, setSelectedReport] = useState<ModerationReport | null>(null)
   const [reportDecision, setReportDecision] = useState<NonNullable<ModerationReport['decision']>>('dismiss')
   const [reportDecisionNote, setReportDecisionNote] = useState('')
@@ -318,6 +362,7 @@ function AdminApp() {
   const [blockDurationDays, setBlockDurationDays] = useState(7)
   const [blockIp, setBlockIp] = useState(false)
   const [reportReview, setReportReview] = useState<{ user: AdminUser; reports: ProfileReport[] } | null>(null)
+  const [galleryReview, setGalleryReview] = useState<AdminGalleryReview | null>(null)
   const [reviewingReports, setReviewingReports] = useState(false)
   const [adminName, setAdminName] = useState('')
   const [adminEmail, setAdminEmail] = useState('')
@@ -421,9 +466,20 @@ function AdminApp() {
     })
   }, [search, userFilters, users])
 
-  const visibleReports = useMemo(() => reports.filter((report) =>
-    (reportStatusFilter === 'all' || report.status === reportStatusFilter) &&
-    (reportTypeFilter === 'all' || report.targetType === reportTypeFilter)), [reportStatusFilter, reportTypeFilter, reports])
+  const visibleReports = useMemo(() => {
+    const query = reportSearch.trim().toLocaleLowerCase('pl')
+    const fromTime = reportFromDate ? new Date(`${reportFromDate}T00:00:00`).getTime() : 0
+    const toTime = reportToDate ? new Date(`${reportToDate}T23:59:59.999`).getTime() : Number.POSITIVE_INFINITY
+    return reports.filter((report) => {
+      const searchable = `${report.reason} ${report.contentPreview} ${report.reporter.name} ${report.target.name} ${report.target.nickname} ${report.targetId}`.toLocaleLowerCase('pl')
+      return (reportStatusFilter === 'all' || report.status === reportStatusFilter)
+        && (reportTypeFilter === 'all' || report.targetType === reportTypeFilter)
+        && (reportCategoryFilter === 'all' || (report.reasonCategory || 'other') === reportCategoryFilter)
+        && (!query || searchable.includes(query))
+        && report.createdAt >= fromTime
+        && report.createdAt <= toTime
+    })
+  }, [reportCategoryFilter, reportFromDate, reportSearch, reportStatusFilter, reportToDate, reportTypeFilter, reports])
 
   function updateUserFilter(key: UserFilterKey, value: string) {
     setUserFilters((filters) => {
@@ -529,6 +585,40 @@ function AdminApp() {
     } catch (actionError) {
       setError(actionError instanceof Error ? actionError.message : 'Nie udało się zmienić weryfikacji profilu.')
     }
+  }
+
+  async function openGalleryReview(user: AdminUser) {
+    setError('')
+    try {
+      const result = await apiRequest<{ photos: AdminGalleryPhoto[]; albums: AdminGalleryAlbum[] }>(`/api/admin/gallery/users/${encodeURIComponent(user.id)}`)
+      setGalleryReview({ user, photos: result.photos, albums: result.albums })
+    } catch (actionError) {
+      setError(actionError instanceof Error ? actionError.message : 'Nie udało się otworzyć galerii użytkownika.')
+    }
+  }
+
+  async function removeGalleryPhoto(photo: AdminGalleryPhoto, albumId?: string) {
+    if (!galleryReview || !can('gallery.photos.delete')) return
+    const description = photo.sourcePostId ? 'zdjęcie z Tablicy i powiązanych albumów' : 'zdjęcie z albumu'
+    if (!window.confirm(`Usunąć ${description} użytkownika ${galleryReview.user.name}?`)) return
+    setError('')
+    setSuccess('')
+    try {
+      const path = photo.sourcePostId
+        ? `/api/admin/gallery/users/${encodeURIComponent(galleryReview.user.id)}/posts/${encodeURIComponent(photo.sourcePostId)}/photo`
+        : `/api/admin/gallery/users/${encodeURIComponent(galleryReview.user.id)}/albums/${encodeURIComponent(albumId ?? '')}/photos/${encodeURIComponent(photo.id)}`
+      await apiRequest(path, { method: 'DELETE' })
+      const result = await apiRequest<{ photos: AdminGalleryPhoto[]; albums: AdminGalleryAlbum[] }>(`/api/admin/gallery/users/${encodeURIComponent(galleryReview.user.id)}`)
+      setGalleryReview({ user: galleryReview.user, photos: result.photos, albums: result.albums })
+      setSuccess('Zdjęcie zostało usunięte.')
+    } catch (actionError) {
+      setError(actionError instanceof Error ? actionError.message : 'Nie udało się usunąć zdjęcia.')
+    }
+  }
+
+  function adminGalleryImageUrl(photo: AdminGalleryPhoto) {
+    const mediaId = photo.mediaId ?? /\/api\/media\/([\da-f-]{36})/i.exec(photo.url)?.[1]
+    return mediaId ? `/api/admin/gallery/media/${encodeURIComponent(mediaId)}` : photo.url
   }
 
   async function reviewReports(user: AdminUser) {
@@ -984,7 +1074,18 @@ function AdminApp() {
                     {(Object.keys(reportTypeLabels) as ModerationReport['targetType'][]).map((type) => <option value={type} key={type}>{reportTypeLabels[type]}</option>)}
                   </select>
                 </label>
+                <label className="report-status-filter">Kategoria
+                  <select value={reportCategoryFilter} onChange={(event) => setReportCategoryFilter(event.target.value as ReportReasonCategory | 'all')}>
+                    <option value="all">Wszystkie</option>
+                    {(Object.keys(reportCategoryLabels) as ReportReasonCategory[]).map((category) => <option value={category} key={category}>{reportCategoryLabels[category]}</option>)}
+                  </select>
+                </label>
               </div>
+            </div>
+            <div className="report-search-filters">
+              <label>Szukaj zgłoszenia<input type="search" value={reportSearch} onChange={(event) => setReportSearch(event.target.value)} placeholder="Użytkownik, powód, treść…" /></label>
+              <label>Od<input type="date" value={reportFromDate} onChange={(event) => setReportFromDate(event.target.value)} /></label>
+              <label>Do<input type="date" value={reportToDate} onChange={(event) => setReportToDate(event.target.value)} /></label>
             </div>
             {visibleReports.length === 0
               ? <p className="empty-state">Brak zgłoszeń w tej kategorii.</p>
@@ -992,7 +1093,11 @@ function AdminApp() {
                 {visibleReports.map((report) => (
                   <article className="moderation-report-card" key={report.id}>
                     <header>
-                      <div><span className={`report-type-pill report-type-${report.targetType}`}>{reportTypeLabels[report.targetType]}</span><span className={`status-pill ${report.status === 'pending' ? 'blocked' : 'active'}`}>{report.status === 'pending' ? 'Oczekuje' : 'Rozpatrzone'}</span></div>
+                      <div>
+                        <span className={`report-type-pill report-type-${report.targetType}`}>{reportTypeLabels[report.targetType]}</span>
+                        <span className="report-category-pill">{report.reasonCategoryLabel || reportCategoryLabels[report.reasonCategory || 'other']}</span>
+                        <span className={`status-pill ${report.status === 'pending' ? 'blocked' : 'active'}`}>{report.status === 'pending' ? 'Do sprawdzenia' : 'Zakończone'}</span>
+                      </div>
                       <small>{formatDate(report.createdAt)}</small>
                     </header>
                     <p className="moderation-report-reason"><strong>Powód:</strong> {report.reason}</p>
@@ -1002,7 +1107,7 @@ function AdminApp() {
                       <span><small>Zgłaszający</small><strong>{report.reporter.name}</strong></span>
                       <span><small>Osoba / autor treści</small><strong>{report.target.name}</strong>{report.target.nickname && <small>@{report.target.nickname}</small>}</span>
                     </div>
-                    {report.status === 'resolved' && <p className="report-decision-summary"><strong>Decyzja:</strong> {report.decision ? reportDecisionLabels[report.decision] : 'Sprawdzone'}{report.decisionNote && ` · ${report.decisionNote}`}</p>}
+                    {report.status === 'resolved' && <p className="report-decision-summary"><strong>Decyzja:</strong> {report.decision ? reportDecisionLabels[report.decision] : 'Sprawdzone'}{report.decisionNote && ` · ${report.decisionNote}`}<small>{report.decidedAt ? `Rozpatrzono ${formatDate(report.decidedAt)}` : ''}{report.decidedBy ? ` przez ${report.decidedBy}` : ''}</small></p>}
                     {report.status === 'pending' && <div className="report-card-actions">
                       {can('reports.manage') && <button className="primary-button" type="button" onClick={() => openReportDecision(report)}><CheckCircle2 size={15} />Rozpatrz zgłoszenie</button>}
                       <small>{report.targetType !== 'profile' ? 'Treści społecznościowe i wiadomości są obecnie przechowywane lokalnie w prototypie; usunięcie z panelu ukryje je u klientów, którzy mają ten sam element, ale nie zastępuje centralnego magazynu treści.' : ''}</small>
@@ -1080,8 +1185,9 @@ function AdminApp() {
                       <td>{user.deletedAt
                         ? <span>—</span>
                         : user.isAdmin
-                          ? <span className="admin-account"><ShieldCheck size={14} />Administrator</span>
+                          ? <div className="user-actions"><span className="admin-account"><ShieldCheck size={14} />Administrator</span>{can('gallery.view') && <button className="row-action gallery-review-action" onClick={() => void openGalleryReview(user)}><Image size={14} />Galeria</button>}</div>
                           : <div className="user-actions">
+                            {can('gallery.view') && <button className="row-action gallery-review-action" onClick={() => void openGalleryReview(user)}><Image size={14} />Galeria</button>}
                             {can('users.block') && <button className={`row-action ${user.blockedAt ? 'unblock' : ''}`} onClick={() => {
                               if (user.blockedAt) void toggleBlock(user, false)
                               else { setBlockingUser(user); setBlockDurationDays(7); setBlockIp(false) }
@@ -1139,10 +1245,37 @@ function AdminApp() {
             </section>
           </div>
         )}
+        {galleryReview && (
+          <div className="modal-backdrop" onClick={() => setGalleryReview(null)}>
+            <section className="gallery-review-dialog" role="dialog" aria-modal="true" aria-labelledby="gallery-review-title" onClick={(event) => event.stopPropagation()}>
+              <header><div><p className="eyebrow">MODERACJA ZDJĘĆ</p><h2 id="gallery-review-title">Galeria użytkownika</h2></div><button type="button" className="secondary-button" onClick={() => setGalleryReview(null)}>Zamknij</button></header>
+              <p className="block-user-summary"><strong>{galleryReview.user.name}</strong> · @{galleryReview.user.nickname}</p>
+              <section className="gallery-review-group">
+                <h3>Zdjęcia z Tablicy ({galleryReview.photos.length})</h3>
+                {galleryReview.photos.length === 0 ? <p className="empty-state">Brak zdjęć z Tablicy.</p> : <div className="gallery-review-grid">{galleryReview.photos.map((photo) => <article key={photo.id}>
+                  <img src={adminGalleryImageUrl(photo)} alt={photo.caption || 'Zdjęcie użytkownika'} />
+                  <small>{formatDate(photo.createdAt)}</small>
+                  {can('gallery.photos.delete') && <button className="row-action delete-user-action" type="button" onClick={() => void removeGalleryPhoto(photo)}><Trash2 size={13} />Usuń zdjęcie</button>}
+                </article>)}</div>}
+              </section>
+              {galleryReview.albums.map((album) => <section className="gallery-review-group" key={album.id}>
+                <h3>{album.name} ({album.photos.length})</h3>
+                {album.photos.length === 0 ? <p className="empty-state">Album nie zawiera zdjęć.</p> : <div className="gallery-review-grid">{album.photos.map((photo) => <article key={photo.id}>
+                  <img src={adminGalleryImageUrl(photo)} alt={photo.caption || 'Zdjęcie użytkownika'} />
+                  <small>{formatDate(photo.createdAt)}</small>
+                  {can('gallery.photos.delete') && <button className="row-action delete-user-action" type="button" onClick={() => void removeGalleryPhoto(photo, album.id)}><Trash2 size={13} />Usuń zdjęcie</button>}
+                </article>)}</div>}
+              </section>)}
+              {!galleryReview.photos.length && !galleryReview.albums.length && <p className="empty-state">Użytkownik nie ma jeszcze zdjęć ani albumów.</p>}
+              {can('gallery.photos.delete') && <p className="data-note">Usunięcie zdjęcia z Tablicy usuwa je również z powiązanych albumów. Zdjęcie z prywatnej Band lub Pokoju nie jest dostępne w tej galerii.</p>}
+            </section>
+          </div>
+        )}
         {selectedReport && (
           <div className="modal-backdrop" onClick={() => setSelectedReport(null)}>
             <form className="report-decision-dialog" role="dialog" aria-modal="true" aria-labelledby="report-decision-title" onSubmit={decideReport} onClick={(event) => event.stopPropagation()}>
               <header><div><p className="eyebrow">ROZPATRZENIE ZGŁOSZENIA</p><h2 id="report-decision-title">{reportTypeLabels[selectedReport.targetType]} · {selectedReport.target.name}</h2></div><button type="button" className="secondary-button" onClick={() => setSelectedReport(null)}>Anuluj</button></header>
+              <p className="block-user-summary"><strong>Kategoria:</strong> {selectedReport.reasonCategoryLabel || reportCategoryLabels[selectedReport.reasonCategory || 'other']}</p>
               <p className="block-user-summary"><strong>Powód:</strong> {selectedReport.reason}</p>
               {selectedReport.contentPreview && <blockquote>{selectedReport.contentPreview}</blockquote>}
               {selectedReport.contentUrl && <a className="report-content-link" href={selectedReport.contentUrl} target="_blank" rel="noreferrer">Otwórz zgłoszone multimedia</a>}

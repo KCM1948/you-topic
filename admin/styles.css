@@ -72,6 +72,10 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 3px
 .report-filter-group { display: flex; flex-wrap: wrap; gap: 12px; }
 .report-status-filter { display: inline-flex; align-items: center; gap: 8px; color: #777c72; font-size: 11px; }
 .report-status-filter select { min-height: 36px; border: 1px solid #dfe2d9; border-radius: 6px; padding: 0 9px; background: #fff; color: var(--ink); font: inherit; }
+.report-search-filters { display: grid; grid-template-columns: minmax(220px, 1fr) repeat(2, minmax(140px, 190px)); gap: 10px; }
+.report-search-filters label { display: grid; gap: 5px; color: #777c72; font-size: 10px; }
+.report-search-filters input { min-width: 0; min-height: 36px; padding: 0 9px; border: 1px solid #dfe2d9; border-radius: 6px; background: #fff; color: var(--ink); font: inherit; }
+.report-search-filters input:focus { border-color: #91b569; outline: 2px solid #91b56933; }
 .report-card-list { display: grid; gap: 12px; }
 .moderation-report-card { display: grid; gap: 12px; padding: 17px; border: 1px solid var(--line); border-radius: 9px; background: #fff; }
 .moderation-report-card > header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
@@ -80,6 +84,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 3px
 .report-type-pill { display: inline-flex; align-items: center; width: fit-content; border-radius: 20px; padding: 5px 8px; background: #edf3ff; color: #41649a; font-size: 9px; font-weight: 700; }
 .report-type-photo, .report-type-video { background: #f3efff; color: #6d4c9c; }
 .report-type-comment, .report-type-message { background: #fff5e7; color: #93651a; }
+.report-category-pill { display: inline-flex; align-items: center; width: fit-content; border: 1px solid #e5e8df; border-radius: 20px; padding: 4px 8px; background: #fafbf8; color: #596253; font-size: 9px; font-weight: 600; }
 .moderation-report-reason { margin: 0; color: #454b41; font-size: 12px; line-height: 1.5; }
 .moderation-report-card blockquote, .report-decision-dialog blockquote { margin: 0; padding: 11px 13px; border-left: 3px solid #dfe7d8; border-radius: 0 6px 6px 0; background: #fafbf8; color: #62685d; font-size: 11px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
 .report-content-link { width: fit-content; color: #416c3d; font-size: 11px; font-weight: 700; text-decoration: none; }
@@ -196,6 +201,17 @@ td small { margin-top: 4px; color: #969a92; font-size: 9px; white-space: normal;
 .report-review-dialog > header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
 .report-review-dialog h2 { margin: 0; font: 700 18px/1.3 var(--font-display); }
 .report-review-dialog .eyebrow { margin-bottom: 5px; }
+.gallery-review-dialog { width: min(100%, 820px); max-height: min(88vh, 900px); display: grid; gap: 14px; overflow: auto; padding: 24px; border: 1px solid var(--line); border-radius: 12px; background: #fff; box-shadow: 0 18px 60px #1115; }
+.gallery-review-dialog > header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.gallery-review-dialog h2 { margin: 0; font: 700 18px/1.3 var(--font-display); }
+.gallery-review-dialog .eyebrow { margin-bottom: 5px; }
+.gallery-review-group { display: grid; gap: 8px; padding-top: 10px; border-top: 1px solid var(--line); }
+.gallery-review-group h3 { margin: 0; color: var(--ink); font-size: 12px; }
+.gallery-review-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(135px, 1fr)); gap: 9px; }
+.gallery-review-grid article { display: grid; align-content: start; gap: 6px; min-width: 0; padding: 7px; border: 1px solid var(--line); border-radius: 7px; background: #fbfcfa; }
+.gallery-review-grid img { width: 100%; aspect-ratio: 1; border-radius: 4px; background: #eef0eb; object-fit: cover; }
+.gallery-review-grid small { color: var(--muted); font-size: 9px; }
+.gallery-review-grid .row-action { justify-self: start; }
 .report-review-list { display: grid; gap: 10px; }
 .report-review-item { padding: 13px; border: 1px solid #e8ebe3; border-radius: 8px; background: #fafbf8; }
 .report-review-item p { margin: 0; color: #42483e; font-size: 12px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -290,7 +306,7 @@ td small { margin-top: 4px; color: #969a92; font-size: 9px; white-space: normal;
   .search-field { width: 100%; }
   .admin-form-grid, .permission-grid { grid-template-columns: minmax(0, 1fr); }
   .admin-editor-heading { flex-direction: column; }
-  .block-user-dialog, .report-review-dialog { padding: 19px; }
+  .block-user-dialog, .report-review-dialog, .gallery-review-dialog { padding: 19px; }
   .report-decision-dialog { padding: 19px; }
   .moderation-report-people { grid-template-columns: minmax(0, 1fr); }
   .form-footer { align-items: flex-start; flex-direction: column; }

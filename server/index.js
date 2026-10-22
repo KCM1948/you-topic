@@ -83,7 +83,7 @@ app.use('/api', (request, response, next) => {
 })
 
 function emptyStore() {
-  return { users: [], announcements: [], admins: [], rankPermissionTemplates: {}, reports: [], reportNotifications: [], socialNotifications: [], socialChatMessages: [], socialBands: [], moderatedItems: [], supportTickets: [], auditLog: [], platformSettings: { registrationEnabled: true }, deletedUsers: [], ipBlocks: [], socialPosts: [], socialMedia: [], socialCrewLinks: [], socialCrewInvitations: [] }
+  return { users: [], announcements: [], admins: [], rankPermissionTemplates: {}, reports: [], reportNotifications: [], socialNotifications: [], socialChatMessages: [], socialBands: [], socialAlbums: [], moderatedItems: [], supportTickets: [], auditLog: [], platformSettings: { registrationEnabled: true }, deletedUsers: [], ipBlocks: [], socialPosts: [], socialMedia: [], socialCrewLinks: [], socialCrewInvitations: [], socialBlocks: [], socialMutes: [] }
 }
 
 function normalizeStore(store) {
@@ -124,6 +124,9 @@ function normalizeStore(store) {
     socialNotifications: Array.isArray(store.socialNotifications) ? store.socialNotifications : [],
     socialChatMessages: Array.isArray(store.socialChatMessages) ? store.socialChatMessages : [],
     socialBands: Array.isArray(store.socialBands) ? store.socialBands : [],
+    socialAlbums: Array.isArray(store.socialAlbums) ? store.socialAlbums : [],
+    socialBlocks: Array.isArray(store.socialBlocks) ? store.socialBlocks : [],
+    socialMutes: Array.isArray(store.socialMutes) ? store.socialMutes : [],
   }
 }
 
@@ -282,6 +285,10 @@ function safeUser(user) {
       crewMembers: 'public',
       crewSize: 'public',
     },
+    socialPrivacy: {
+      profileAudience: user.socialPrivacy?.profileAudience ?? 'public',
+      crewInviteAudience: user.socialPrivacy?.crewInviteAudience ?? 'everyone',
+    },
     online: true,
     crewMembers: 0,
     crewSize: 0,
@@ -422,8 +429,15 @@ const postCreationLimit = rateLimit({ windowMs: 60 * 60 * 1000, limit: 30, stand
 const crewMutationLimit = rateLimit({ windowMs: 15 * 60 * 1000, limit: 40, standardHeaders: true, legacyHeaders: false })
 const socialDirectoryLimit = rateLimit({ windowMs: 60 * 1000, limit: 120, standardHeaders: true, legacyHeaders: false })
 
-function publicSocialPerson(user) {
+function publicSocialPerson(user, store = null) {
   const visibility = user.profileVisibility ?? {}
+  const crewMemberCount = store
+    ? new Set(store.socialCrewLinks
+      .filter((link) => link.firstUserId === user.id || link.secondUserId === user.id)
+      .map((link) => link.firstUserId === user.id ? link.secondUserId : link.firstUserId)
+      .filter((memberId) => store.users.some((member) => member.id === memberId)
+        && !isSocialBlocked(store, user.id, memberId))).size
+    : 0
   return {
     id: user.id,
     profileVerified: Boolean(user.profileVerified),
@@ -440,11 +454,34 @@ function publicSocialPerson(user) {
     coverImage: user.coverImage || '',
     socialLinks: visibility.socialLinks === 'public' ? user.socialLinks || {} : {},
     profileVisibility: visibility,
+    socialPrivacy: {
+      profileAudience: user.socialPrivacy?.profileAudience ?? 'public',
+      crewInviteAudience: user.socialPrivacy?.crewInviteAudience ?? 'everyone',
+    },
     gender: user.gender,
     online: true,
-    crewMembers: 0,
-    crewSize: 0,
+    crewMembers: crewMemberCount,
+    crewSize: crewMemberCount,
   }
+}
+
+function isSocialBlocked(store, firstUserId, secondUserId) {
+  return store.socialBlocks.some((block) =>
+    (block.blockerId === firstUserId && block.blockedId === secondUserId)
+    || (block.blockerId === secondUserId && block.blockedId === firstUserId))
+}
+
+function canViewSocialProfile(store, viewerId, user) {
+  if (!user) return false
+  const audience = user.socialPrivacy?.profileAudience ?? 'public'
+  return audience === 'public' || viewerId === user.id
+    || (audience === 'crew' && isCrewMember(store, viewerId, user.id))
+}
+
+function blockedUserIds(store, userId) {
+  return store.socialBlocks
+    .filter((block) => block.blockerId === userId || block.blockedId === userId)
+    .map((block) => block.blockerId === userId ? block.blockedId : block.blockerId)
 }
 
 function isCrewMember(store, firstUserId, secondUserId) {
@@ -468,8 +505,10 @@ function publicBand(band, users) {
   }
 }
 
-function appendSocialNotification(store, userId, actorId, type, message, postId) {
+function appendSocialNotification(store, userId, actorId, type, message, postId, chatHandle, crewInvitationId) {
   if (!userId || userId === actorId) return
+  if (isSocialBlocked(store, userId, actorId)) return
+  if (type === 'chat_message' && store.socialMutes.some((mute) => mute.userId === userId && mute.mutedUserId === actorId)) return
   store.socialNotifications.unshift({
     id: crypto.randomUUID(),
     userId,
@@ -477,6 +516,8 @@ function appendSocialNotification(store, userId, actorId, type, message, postId)
     type,
     message,
     postId: postId ? String(postId) : undefined,
+    chatHandle,
+    crewInvitationId,
     createdAt: Date.now(),
     readAt: null,
   })
@@ -503,6 +544,7 @@ function socialPostForUser(post, userId, users) {
   return {
     ...post.data,
     id: Number(post.id),
+    createdAt: post.createdAt ?? post.data.createdAt,
     author: author ? publicSocialPerson(author) : post.author,
     comments,
     likes: likedBy.length,
@@ -517,18 +559,27 @@ function socialPostForUser(post, userId, users) {
   }
 }
 
-async function readSocialPosts(userId, store = null) {
+async function readSocialPosts(userId, store = null, { before, beforeId, limit = 30 } = {}) {
   store ??= await readStore()
   const accessibleBandIds = store.socialBands
     .filter((band) => band.adminId === userId || band.memberIds.includes(userId))
     .map((band) => band.id)
+  const inaccessibleUserIds = blockedUserIds(store, userId).concat(
+    store.users.filter((user) => !canViewSocialProfile(store, userId, user)).map((user) => user.id),
+  )
   if (database) {
     const { rows } = await database.query(
-      'SELECT id, author_id, data, liked_by, saved_by, boosted_by FROM youtopic_social_posts WHERE band_id IS NULL OR band_id = ANY($1::text[]) ORDER BY created_at DESC, id DESC LIMIT 300',
-      [accessibleBandIds],
+      `SELECT id, author_id, data, liked_by, saved_by, boosted_by, created_at
+       FROM youtopic_social_posts
+       WHERE (band_id IS NULL OR band_id = ANY($1::text[]))
+         AND author_id <> ALL($2::text[])
+         AND ($3::bigint IS NULL OR (created_at, id) < ($3, $4::bigint))
+       ORDER BY created_at DESC, id DESC LIMIT $5`,
+      [accessibleBandIds, inaccessibleUserIds, before ?? null, beforeId ?? before ?? null, limit],
     )
     return rows.map((row) => socialPostForUser({
       id: row.id,
+      createdAt: Number(row.created_at),
       authorId: row.author_id,
       data: row.data,
       likedBy: row.liked_by,
@@ -539,7 +590,15 @@ async function readSocialPosts(userId, store = null) {
     }, userId, store.users))
   }
   return store.socialPosts
-    .filter((post) => !post.data.bandId || accessibleBandIds.includes(post.data.bandId))
+    .filter((post) => (!post.data.bandId || accessibleBandIds.includes(post.data.bandId))
+      && !inaccessibleUserIds.includes(post.authorId)
+      && (before === undefined
+        || Number(post.createdAt ?? post.data.createdAt ?? post.id) < before
+        || Number(post.createdAt ?? post.data.createdAt ?? post.id) === before && Number(post.id) < (beforeId ?? Number.POSITIVE_INFINITY)))
+    .sort((first, second) =>
+      Number(second.createdAt ?? second.data.createdAt ?? second.id) - Number(first.createdAt ?? first.data.createdAt ?? first.id)
+      || Number(second.id) - Number(first.id))
+    .slice(0, limit)
     .map((post) => socialPostForUser(post, userId, store.users))
 }
 
@@ -552,31 +611,25 @@ async function readMedia(mediaId, ownerId, allowPublished = false) {
     if (!allowPublished) return null
     const mediaUrl = `/api/media/${mediaId}`
     const { rows: references } = await database.query(`
-      SELECT 1
+      SELECT author_id, band_id
       FROM youtopic_social_posts
-      WHERE band_id IS NULL AND (data->>'image' = $1 OR data->>'video' = $1
-        OR EXISTS (
-          SELECT 1 FROM jsonb_array_elements(COALESCE(data->'comments', '[]'::jsonb)) AS comment
-          WHERE comment->>'audioUrl' = $1
-        ))
-      LIMIT 1
-    `, [mediaUrl])
-    if (references.length) return media
-    const { rows: bandReferences } = await database.query(`
-      SELECT band_id
-      FROM youtopic_social_posts
-      WHERE band_id IS NOT NULL AND (
-        data->>'image' = $1 OR data->>'video' = $1
+      WHERE data->>'image' = $1 OR data->>'video' = $1
         OR EXISTS (
           SELECT 1 FROM jsonb_array_elements(COALESCE(data->'comments', '[]'::jsonb)) AS comment
           WHERE comment->>'audioUrl' = $1
         )
-      )
-      LIMIT 20
+      LIMIT 100
     `, [mediaUrl])
-    if (!bandReferences.length) return null
     const store = await readStore()
-    return bandReferences.some(({ band_id }) => bandForMember(store, band_id, ownerId)) ? media : null
+    const postVisible = references.some(({ author_id, band_id }) =>
+      !isSocialBlocked(store, ownerId, author_id)
+      && canViewSocialProfile(store, ownerId, store.users.find((user) => user.id === author_id))
+      && (!band_id || bandForMember(store, band_id, ownerId)))
+    const albumVisible = store.socialAlbums.some((album) =>
+      album.photos.some((photo) => photo.mediaId === mediaId)
+      && !isSocialBlocked(store, ownerId, album.ownerId)
+      && canViewSocialProfile(store, ownerId, store.users.find((user) => user.id === album.ownerId)))
+    return postVisible || albumVisible ? media : null
   }
   const store = await readStore()
   const media = store.socialMedia.find((item) => item.id === mediaId && item.ownerId === ownerId)
@@ -584,11 +637,50 @@ async function readMedia(mediaId, ownerId, allowPublished = false) {
   if (!allowPublished) return null
   const mediaUrl = `/api/media/${mediaId}`
   const isPublished = store.socialPosts.some((post) => {
-    const referencesMedia = post.data.image === mediaUrl || post.data.video === mediaUrl || post.comments.some((comment) => comment.audioUrl === mediaUrl)
-    return referencesMedia && (!post.data.bandId || bandForMember(store, post.data.bandId, ownerId))
+    const referencesMedia = post.data.image === mediaUrl || post.data.video === mediaUrl
+      || (post.comments ?? post.data.comments ?? []).some((comment) => comment.audioUrl === mediaUrl)
+    return referencesMedia
+      && !isSocialBlocked(store, ownerId, post.authorId)
+      && canViewSocialProfile(store, ownerId, store.users.find((user) => user.id === post.authorId))
+      && (!post.data.bandId || bandForMember(store, post.data.bandId, ownerId))
   })
-  const publishedMedia = isPublished ? store.socialMedia.find((item) => item.id === mediaId) : null
+  const albumPublished = store.socialAlbums.some((album) =>
+    album.photos.some((photo) => photo.mediaId === mediaId)
+    && !isSocialBlocked(store, ownerId, album.ownerId)
+    && canViewSocialProfile(store, ownerId, store.users.find((user) => user.id === album.ownerId)))
+  const publishedMedia = isPublished || albumPublished ? store.socialMedia.find((item) => item.id === mediaId) : null
   return publishedMedia ? { content_type: publishedMedia.contentType, data: Buffer.from(publishedMedia.data, 'base64') } : null
+}
+
+async function deleteUnreferencedMedia(mediaId) {
+  if (!mediaId) return
+  const mediaUrl = `/api/media/${mediaId}`
+  if (database) {
+    const [{ rows: postReferences }, store] = await Promise.all([
+      database.query(`
+        SELECT 1 FROM youtopic_social_posts
+        WHERE data->>'image' = $1 OR data->>'video' = $1
+          OR EXISTS (
+            SELECT 1 FROM jsonb_array_elements(COALESCE(data->'comments', '[]'::jsonb)) AS comment
+            WHERE comment->>'audioUrl' = $1
+          )
+        LIMIT 1
+      `, [mediaUrl]),
+      readStore(),
+    ])
+    if (postReferences.length || store.socialAlbums.some((album) => album.photos.some((photo) => photo.mediaId === mediaId))) return
+    await database.query('DELETE FROM youtopic_social_media WHERE id = $1', [mediaId])
+    return
+  }
+  await updateStore((store) => {
+    const referencedByPost = store.socialPosts.some((post) =>
+      post.data.image === mediaUrl || post.data.video === mediaUrl
+      || (post.comments ?? post.data.comments ?? []).some((comment) => comment.audioUrl === mediaUrl))
+    const referencedByAlbum = store.socialAlbums.some((album) => album.photos.some((photo) => photo.mediaId === mediaId))
+    if (!referencedByPost && !referencedByAlbum) {
+      store.socialMedia = store.socialMedia.filter((item) => item.id !== mediaId)
+    }
+  })
 }
 
 function validMediaPayload(contentType, data) {
@@ -648,15 +740,275 @@ app.get('/api/media/:mediaId', requireAuthentication, async (request, response) 
   return response.send(media.data)
 })
 
+function galleryPostPhoto(post) {
+  return {
+    id: `post:${post.id}`,
+    sourcePostId: String(post.id),
+    url: post.data.image,
+    caption: post.data.text ?? '',
+    createdAt: Number(post.createdAt ?? post.data.createdAt ?? post.id),
+  }
+}
+
+function isGalleryPhotoModerated(store, ownerId, postId) {
+  return store.moderatedItems.some((item) => item.targetUserId === ownerId
+    && (item.targetId === `post:${postId}` || item.targetId === `photo:${postId}`))
+}
+
+app.get('/api/gallery/:handle', requireAuthentication, async (request, response) => {
+  const store = request.authStore
+  const owner = store.users.find((user) => defaultNickname(user).toLocaleLowerCase('pl-PL') === request.params.handle.toLocaleLowerCase('pl-PL'))
+  if (!owner || owner.emailVerified !== true
+    || isSocialBlocked(store, request.authUser.id, owner.id)
+    || !canViewSocialProfile(store, request.authUser.id, owner)) {
+    return response.status(404).json({ error: 'Nie znaleziono dostępnej galerii.' })
+  }
+  let sourcePosts
+  if (database) {
+    const { rows } = await database.query(
+      `SELECT id, data, created_at FROM youtopic_social_posts
+       WHERE author_id = $1 AND band_id IS NULL AND data ? 'image'
+       ORDER BY created_at DESC, id DESC LIMIT 500`,
+      [owner.id],
+    )
+    sourcePosts = rows.map((row) => ({ id: row.id, data: row.data, createdAt: Number(row.created_at) }))
+  } else {
+    sourcePosts = store.socialPosts
+      .filter((post) => post.authorId === owner.id && !post.data.bandId && typeof post.data.image === 'string')
+      .sort((first, second) => Number(second.createdAt ?? second.id) - Number(first.createdAt ?? first.id))
+      .slice(0, 500)
+  }
+  const albums = store.socialAlbums
+    .filter((album) => album.ownerId === owner.id)
+    .map(({ id, name, createdAt, photos }) => ({
+      id,
+      name,
+      createdAt,
+      photos: photos.filter((photo) => !photo.sourcePostId || !isGalleryPhotoModerated(store, owner.id, photo.sourcePostId)),
+    }))
+  return response.json({
+    photos: sourcePosts.filter((post) => !isGalleryPhotoModerated(store, owner.id, post.id)).map(galleryPostPhoto),
+    albums,
+    owner: publicSocialPerson(owner, store),
+  })
+})
+
+app.post('/api/gallery/albums', requireAuthentication, async (request, response) => {
+  const name = typeof request.body?.name === 'string' ? request.body.name.trim().slice(0, 60) : ''
+  if (!name) return response.status(400).json({ error: 'Podaj nazwę albumu.' })
+  const album = await updateStore((store) => {
+    const ownedAlbums = store.socialAlbums.filter((item) => item.ownerId === request.authUser.id)
+    if (ownedAlbums.length >= 30) return null
+    const created = { id: crypto.randomUUID(), ownerId: request.authUser.id, name, createdAt: Date.now(), photos: [] }
+    store.socialAlbums.push(created)
+    return { id: created.id, name: created.name, createdAt: created.createdAt, photos: created.photos }
+  })
+  if (!album) return response.status(409).json({ error: 'Możesz utworzyć maksymalnie 30 albumów.' })
+  return response.status(201).json({ album })
+})
+
+app.post('/api/gallery/albums/:albumId/photos', requireAuthentication, async (request, response) => {
+  const { sourcePostId, mediaId } = request.body ?? {}
+  const caption = typeof request.body?.caption === 'string' ? request.body.caption.trim().slice(0, 300) : ''
+  if (Boolean(sourcePostId) === Boolean(mediaId) || (sourcePostId && !/^\d+$/.test(String(sourcePostId)))
+    || (mediaId && !/^[\da-f-]{36}$/i.test(String(mediaId)))) {
+    return response.status(400).json({ error: 'Wybierz zdjęcie opublikowane na Tablicy albo nowe zdjęcie.' })
+  }
+  let photoSource = null
+  if (sourcePostId) {
+    if (database) {
+      const { rows } = await database.query(
+        "SELECT id, author_id, data, band_id, created_at FROM youtopic_social_posts WHERE id = $1 AND author_id = $2 AND band_id IS NULL AND data ? 'image'",
+        [sourcePostId, request.authUser.id],
+      )
+      photoSource = rows[0] ? { postId: String(rows[0].id), url: rows[0].data.image, createdAt: Number(rows[0].created_at) } : null
+    } else {
+      const post = request.authStore.socialPosts.find((item) => String(item.id) === String(sourcePostId)
+        && item.authorId === request.authUser.id && !item.data.bandId && typeof item.data.image === 'string')
+      photoSource = post ? { postId: String(post.id), url: post.data.image, createdAt: Number(post.createdAt ?? post.id) } : null
+    }
+    if (!photoSource) return response.status(404).json({ error: 'Nie znaleziono Twojego zdjęcia z Tablicy.' })
+    if (isGalleryPhotoModerated(request.authStore, request.authUser.id, photoSource.postId)) return response.status(404).json({ error: 'To zdjęcie jest niedostępne po decyzji moderacyjnej.' })
+  } else {
+    const media = await readMedia(mediaId, request.authUser.id)
+    if (!media || !media.content_type.startsWith('image/')) return response.status(400).json({ error: 'Nie znaleziono przesłanego zdjęcia.' })
+    photoSource = { mediaId, url: `/api/media/${mediaId}`, createdAt: Date.now() }
+  }
+  const result = await updateStore((store) => {
+    const album = store.socialAlbums.find((item) => item.id === request.params.albumId && item.ownerId === request.authUser.id)
+    if (!album) return { error: 'Nie znaleziono Twojego albumu.' }
+    if (album.photos.length >= 200) return { error: 'Album może zawierać maksymalnie 200 zdjęć.' }
+    if (album.photos.some((photo) => photo.sourcePostId === photoSource.postId
+      || photo.mediaId === photoSource.mediaId)) return { error: 'To zdjęcie jest już w tym albumie.' }
+    const photo = { id: crypto.randomUUID(), ...photoSource, caption, createdAt: Date.now() }
+    album.photos.unshift(photo)
+    return { photo, album: { id: album.id, name: album.name, createdAt: album.createdAt, photos: album.photos } }
+  })
+  if (result.error) return response.status(result.error === 'Nie znaleziono Twojego albumu.' ? 404 : 409).json({ error: result.error })
+  return response.status(201).json(result)
+})
+
+app.delete('/api/gallery/albums/:albumId/photos/:photoId', requireAuthentication, async (request, response) => {
+  const removal = await updateStore((store) => {
+    const album = store.socialAlbums.find((item) => item.id === request.params.albumId && item.ownerId === request.authUser.id)
+    if (!album) return null
+    const photo = album.photos.find((item) => item.id === request.params.photoId)
+    if (!photo) return null
+    album.photos = album.photos.filter((photo) => photo.id !== request.params.photoId)
+    return { mediaId: photo.mediaId ?? '' }
+  })
+  if (!removal) return response.status(404).json({ error: 'Nie znaleziono zdjęcia w Twoim albumie.' })
+  await deleteUnreferencedMedia(removal.mediaId)
+  return response.json({ ok: true })
+})
+
+app.delete('/api/gallery/albums/:albumId', requireAuthentication, async (request, response) => {
+  const removedMediaIds = await updateStore((store) => {
+    const album = store.socialAlbums.find((item) => item.id === request.params.albumId && item.ownerId === request.authUser.id)
+    if (!album) return null
+    const mediaIds = album.photos.map((photo) => photo.mediaId).filter(Boolean)
+    const originalLength = store.socialAlbums.length
+    store.socialAlbums = store.socialAlbums.filter((album) => !(album.id === request.params.albumId && album.ownerId === request.authUser.id))
+    return store.socialAlbums.length < originalLength ? mediaIds : null
+  })
+  if (!removedMediaIds) return response.status(404).json({ error: 'Nie znaleziono Twojego albumu.' })
+  await Promise.all(removedMediaIds.map(deleteUnreferencedMedia))
+  return response.json({ ok: true })
+})
+
+app.delete('/api/gallery/posts/:postId/photo', requireAuthentication, async (request, response) => {
+  if (!/^\d+$/.test(request.params.postId)) return response.status(400).json({ error: 'Nieprawidłowy identyfikator posta.' })
+  let removed = false
+  let removedMediaId = ''
+  if (database) {
+    const { rows } = await database.query('SELECT author_id, data FROM youtopic_social_posts WHERE id = $1', [request.params.postId])
+    const post = rows[0]
+    if (!post || post.author_id !== request.authUser.id || !post.data.image) return response.status(404).json({ error: 'Nie znaleziono Twojego zdjęcia.' })
+    removedMediaId = /^\/api\/media\/([\da-f-]{36})$/i.exec(post.data.image)?.[1] ?? ''
+    const updatedData = { ...post.data }
+    delete updatedData.image
+    if (!updatedData.text && !updatedData.video && !updatedData.externalUrl && !updatedData.sharedFrom) {
+      await database.query('DELETE FROM youtopic_social_posts WHERE id = $1 AND author_id = $2', [request.params.postId, request.authUser.id])
+    } else {
+      await database.query('UPDATE youtopic_social_posts SET data = $1::jsonb WHERE id = $2 AND author_id = $3', [JSON.stringify(updatedData), request.params.postId, request.authUser.id])
+    }
+    removed = true
+  } else {
+    removed = await updateStore((store) => {
+      const post = store.socialPosts.find((item) => String(item.id) === request.params.postId && item.authorId === request.authUser.id)
+      if (!post || !post.data.image) return false
+      removedMediaId = /^\/api\/media\/([\da-f-]{36})$/i.exec(post.data.image)?.[1] ?? ''
+      delete post.data.image
+      store.socialAlbums.forEach((album) => {
+        album.photos = album.photos.filter((photo) => photo.sourcePostId !== String(post.id))
+      })
+      if (!post.data.text && !post.data.video && !post.data.externalUrl && !post.data.sharedFrom) {
+        store.socialPosts = store.socialPosts.filter((item) => item !== post)
+      }
+      return true
+    })
+  }
+  if (!removed) return response.status(404).json({ error: 'Nie znaleziono Twojego zdjęcia.' })
+  if (database) {
+    await updateStore((store) => store.socialAlbums.forEach((album) => {
+      album.photos = album.photos.filter((photo) => photo.sourcePostId !== request.params.postId)
+    }))
+  }
+  await deleteUnreferencedMedia(removedMediaId)
+  return response.json({ ok: true })
+})
+
 app.get('/api/users', requireAuthentication, socialDirectoryLimit, async (request, response) => {
   const query = typeof request.query.q === 'string' ? request.query.q.trim().toLocaleLowerCase('pl-PL') : ''
   const store = request.authStore
   const users = store.users
-    .filter((user) => user.id !== request.authUser.id && user.emailVerified === true && !isUserBlocked(user))
-    .map(publicSocialPerson)
+    .filter((user) => user.id !== request.authUser.id && user.emailVerified === true && !isUserBlocked(user)
+      && !isSocialBlocked(store, request.authUser.id, user.id)
+      && canViewSocialProfile(store, request.authUser.id, user))
+    .map((user) => publicSocialPerson(user, store))
     .filter((user) => !query || `${user.name} ${user.handle} ${user.nickname}`.toLocaleLowerCase('pl-PL').includes(query))
     .slice(0, 50)
   return response.json({ users })
+})
+
+app.get('/api/blocks', requireAuthentication, async (request, response) => {
+  const store = request.authStore
+  const ids = store.socialBlocks.filter((item) => item.blockerId === request.authUser.id).map((item) => item.blockedId)
+  const users = store.users.filter((user) => ids.includes(user.id)).map(publicSocialPerson)
+  return response.json({ users })
+})
+
+app.post('/api/users/:userId/block', requireAuthentication, crewMutationLimit, async (request, response) => {
+  const result = await updateStore((store) => {
+    const target = store.users.find((user) => user.id === request.params.userId && user.emailVerified === true)
+    if (!target || target.id === request.authUser.id) return { error: 'Nie znaleziono użytkownika do zablokowania.' }
+    if (!store.socialBlocks.some((item) => item.blockerId === request.authUser.id && item.blockedId === target.id)) {
+      store.socialBlocks.push({ blockerId: request.authUser.id, blockedId: target.id, createdAt: Date.now() })
+    }
+    store.socialCrewLinks = store.socialCrewLinks.filter((link) => !(
+      (link.firstUserId === request.authUser.id && link.secondUserId === target.id)
+      || (link.secondUserId === request.authUser.id && link.firstUserId === target.id)))
+    store.socialCrewInvitations = store.socialCrewInvitations.map((invitation) =>
+      invitation.status === 'pending'
+        && [invitation.fromId, invitation.toId].includes(request.authUser.id)
+        && [invitation.fromId, invitation.toId].includes(target.id)
+        ? { ...invitation, status: 'cancelled', respondedAt: Date.now() }
+        : invitation)
+    return { ok: true }
+  })
+  if (result.error) return response.status(404).json({ error: result.error })
+  return response.json(result)
+})
+
+app.delete('/api/users/:userId/block', requireAuthentication, crewMutationLimit, async (request, response) => {
+  const removed = await updateStore((store) => {
+    const before = store.socialBlocks.length
+    store.socialBlocks = store.socialBlocks.filter((item) => !(item.blockerId === request.authUser.id && item.blockedId === request.params.userId))
+    return store.socialBlocks.length < before
+  })
+  if (!removed) return response.status(404).json({ error: 'Nie znaleziono blokady.' })
+  return response.json({ ok: true })
+})
+
+app.get('/api/chat/mutes', requireAuthentication, async (request, response) => {
+  const store = request.authStore
+  const usersById = new Map(store.users.map((user) => [user.id, user]))
+  const handles = store.socialMutes
+    .filter((item) => item.userId === request.authUser.id)
+    .map((item) => usersById.get(item.mutedUserId))
+    .filter(Boolean)
+    .map(defaultNickname)
+  return response.json({ handles })
+})
+
+app.post('/api/chat/:handle/mute', requireAuthentication, crewMutationLimit, async (request, response) => {
+  const result = await updateStore((store) => {
+    const target = store.users.find((user) => defaultNickname(user) === request.params.handle && user.id !== request.authUser.id)
+    if (!target || isSocialBlocked(store, request.authUser.id, target.id)) return { error: 'Nie znaleziono rozmowy do wyciszenia.' }
+    if (!store.socialMutes.some((item) => item.userId === request.authUser.id && item.mutedUserId === target.id)) {
+      store.socialMutes.push({ userId: request.authUser.id, mutedUserId: target.id, createdAt: Date.now() })
+    }
+    const mutedAt = Date.now()
+    for (const notification of store.socialNotifications) {
+      if (notification.userId === request.authUser.id && notification.type === 'chat_message'
+        && notification.actorId === target.id && !notification.readAt) notification.readAt = mutedAt
+    }
+    return { ok: true }
+  })
+  if (result.error) return response.status(404).json({ error: result.error })
+  return response.json(result)
+})
+
+app.delete('/api/chat/:handle/mute', requireAuthentication, crewMutationLimit, async (request, response) => {
+  const removed = await updateStore((store) => {
+    const target = store.users.find((user) => defaultNickname(user) === request.params.handle)
+    if (!target) return false
+    const before = store.socialMutes.length
+    store.socialMutes = store.socialMutes.filter((item) => !(item.userId === request.authUser.id && item.mutedUserId === target.id))
+    return before !== store.socialMutes.length
+  })
+  if (!removed) return response.status(404).json({ error: 'Nie znaleziono wyciszonej rozmowy.' })
+  return response.json({ ok: true })
 })
 
 app.get('/api/crew', requireAuthentication, socialDirectoryLimit, async (request, response) => {
@@ -666,6 +1018,7 @@ app.get('/api/crew', requireAuthentication, socialDirectoryLimit, async (request
     .filter((link) => link.firstUserId === request.authUser.id || link.secondUserId === request.authUser.id)
     .map((link) => [usersById.get(link.firstUserId), usersById.get(link.secondUserId)])
     .filter((pair) => pair.every(Boolean))
+    .filter((pair) => pair.every((user) => canViewSocialProfile(store, request.authUser.id, user)))
     .map((pair) => pair.map((user) => defaultNickname(user)))
   const invitations = store.socialCrewInvitations
     .filter((invitation) => invitation.fromId === request.authUser.id || invitation.toId === request.authUser.id)
@@ -677,16 +1030,21 @@ app.get('/api/crew', requireAuthentication, socialDirectoryLimit, async (request
       respondedAt: invitation.respondedAt,
     }))
     .filter((invitation) => invitation.from && invitation.to)
-    .map((invitation) => ({ ...invitation, from: publicSocialPerson(invitation.from), to: publicSocialPerson(invitation.to) }))
-  return response.json({ links, invitations })
+    .map((invitation) => ({ ...invitation, from: publicSocialPerson(invitation.from, store), to: publicSocialPerson(invitation.to, store) }))
+  return response.json({ links, invitations, memberCount: links.length })
 })
 
 app.post('/api/crew/invitations', requireAuthentication, crewMutationLimit, async (request, response) => {
   const toUserId = typeof request.body?.toUserId === 'string' ? request.body.toUserId : ''
   if (!toUserId || toUserId === request.authUser.id) return response.status(400).json({ error: 'Wybierz użytkownika, którego chcesz dodać do Ekipy.' })
-  const result = await updateStore((store) => {
+  const result = await updateStore(async (store) => {
     const target = store.users.find((user) => user.id === toUserId && user.emailVerified === true && !isUserBlocked(user))
-    if (!target) return { error: 'Nie znaleziono aktywnego konta tego użytkownika.' }
+    if (!target || isSocialBlocked(store, request.authUser.id, target.id)
+      || !canViewSocialProfile(store, request.authUser.id, target)) return { error: 'Nie znaleziono aktywnego konta tego użytkownika.' }
+    const inviteAudience = target.socialPrivacy?.crewInviteAudience ?? 'everyone'
+    if (inviteAudience === 'nobody') {
+      return { error: 'Ten użytkownik nie przyjmuje zaproszeń do Ekipy od Ciebie.' }
+    }
     const pair = [request.authUser.id, target.id].sort()
     if (store.socialCrewLinks.some((link) => [link.firstUserId, link.secondUserId].sort().join(':') === pair.join(':'))) {
       return { error: 'Jesteście już w swoich Ekipach.' }
@@ -696,8 +1054,8 @@ app.post('/api/crew/invitations', requireAuthentication, crewMutationLimit, asyn
     if (pending) return { error: 'Zaproszenie do Ekipy już czeka na odpowiedź.' }
     const invitation = { id: crypto.randomUUID(), fromId: request.authUser.id, toId: target.id, status: 'pending', createdAt: Date.now() }
     store.socialCrewInvitations.push(invitation)
-    appendSocialNotification(store, target.id, request.authUser.id, 'crew_invitation', 'zaprasza Cię do swojej Ekipy.')
-    return { invitation: { ...invitation, from: publicSocialPerson(request.authUser), to: publicSocialPerson(target) } }
+    appendSocialNotification(store, target.id, request.authUser.id, 'crew_invitation', 'zaprasza Cię do swojej Ekipy.', undefined, undefined, invitation.id)
+    return { invitation: { ...invitation, from: publicSocialPerson(request.authUser, store), to: publicSocialPerson(target, store) } }
   })
   if (result.error) return response.status(409).json({ error: result.error })
   return response.status(201).json(result)
@@ -805,11 +1163,13 @@ app.get('/api/notifications', requireAuthentication, async (request, response) =
   const usersById = new Map(store.users.map((user) => [user.id, user]))
   const notifications = store.socialNotifications
     .filter((item) => item.userId === request.authUser.id)
+    .filter((item) => !isSocialBlocked(store, request.authUser.id, item.actorId)
+      && !(item.type === 'chat_message' && store.socialMutes.some((mute) => mute.userId === request.authUser.id && mute.mutedUserId === item.actorId)))
     .sort((first, second) => second.createdAt - first.createdAt)
     .slice(0, 100)
-    .map(({ id, actorId, type, message, postId, createdAt, readAt }) => ({
+    .map(({ id, actorId, type, message, postId, chatHandle, crewInvitationId, createdAt, readAt }) => ({
       id, actor: usersById.has(actorId) ? publicSocialPerson(usersById.get(actorId)) : null,
-      type, message, postId, createdAt, readAt,
+      type, message, postId, chatHandle, crewInvitationId, createdAt, readAt,
     }))
   response.set('Cache-Control', 'no-store')
   return response.json({ notifications })
@@ -817,16 +1177,29 @@ app.get('/api/notifications', requireAuthentication, async (request, response) =
 
 app.patch('/api/notifications/read', requireAuthentication, async (request, response) => {
   const id = typeof request.body?.id === 'string' ? request.body.id : ''
+  const chatHandle = typeof request.body?.chatHandle === 'string' ? request.body.chatHandle : ''
   const now = Date.now()
   await updateStore((store) => {
     for (const notification of store.socialNotifications) {
-      if (notification.userId === request.authUser.id && (!id || notification.id === id)) notification.readAt ??= now
+      const matchesChat = chatHandle && notification.type === 'chat_message' && notification.chatHandle === chatHandle
+      if (notification.userId === request.authUser.id && (id ? notification.id === id : matchesChat || !chatHandle)) notification.readAt ??= now
     }
   })
   return response.json({ ok: true })
 })
 
 const chatMutationLimit = rateLimit({ windowMs: 60 * 1000, limit: 60, standardHeaders: true, legacyHeaders: false })
+const reportCategoryLabels = new Map([
+  ['terms_violation', 'Naruszenie regulaminu'],
+  ['harassment', 'Nękanie lub zastraszanie'],
+  ['hate', 'Mowa nienawiści'],
+  ['violence', 'Przemoc lub groźby'],
+  ['spam', 'Spam lub oszustwo'],
+  ['privacy', 'Naruszenie prywatności'],
+  ['impersonation', 'Podszywanie się'],
+  ['sexual_content', 'Niedozwolone treści seksualne'],
+  ['other', 'Inne'],
+])
 
 app.get('/api/chat', requireAuthentication, socialDirectoryLimit, async (request, response) => {
   if (request.query.scope !== undefined && !['public', 'room'].includes(request.query.scope)) return response.status(400).json({ error: 'Nieprawidłowy rodzaj rozmowy.' })
@@ -835,12 +1208,13 @@ app.get('/api/chat', requireAuthentication, socialDirectoryLimit, async (request
   const store = request.authStore
   const recipientHandle = typeof request.query.with === 'string' ? request.query.with : ''
   const recipient = scope === 'room' ? store.users.find((user) => defaultNickname(user) === recipientHandle) : null
-  if (scope === 'room' && (!recipient || !isCrewMember(store, request.authUser.id, recipient.id))) {
+  if (scope === 'room' && (!recipient || isSocialBlocked(store, request.authUser.id, recipient.id) || !isCrewMember(store, request.authUser.id, recipient.id))) {
     return response.status(403).json({ error: 'Prywatny czat jest dostępny po zaakceptowaniu zaproszenia do Ekipy.' })
   }
   const messages = store.socialChatMessages
     .filter((item) => store.users.some((user) => user.id === item.authorId)
       && (scope !== 'room' || store.users.some((user) => user.id === item.recipientId))
+      && (scope !== 'public' || !isSocialBlocked(store, request.authUser.id, item.authorId))
       && item.scope === scope && (scope === 'public'
       || ((item.authorId === request.authUser.id && item.recipientId === recipient.id)
         || (item.authorId === recipient.id && item.recipientId === request.authUser.id))))
@@ -865,7 +1239,7 @@ app.post('/api/chat', requireAuthentication, chatMutationLimit, async (request, 
   if (!text || text.length > 2000) return response.status(400).json({ error: 'Wiadomość musi mieć od 1 do 2000 znaków.' })
   const result = await updateStore((store) => {
     const recipient = scope === 'room' ? store.users.find((user) => defaultNickname(user) === recipientHandle) : null
-    if (scope === 'room' && (!recipient || !isCrewMember(store, request.authUser.id, recipient.id))) {
+    if (scope === 'room' && (!recipient || isSocialBlocked(store, request.authUser.id, recipient.id) || !isCrewMember(store, request.authUser.id, recipient.id))) {
       return { error: 'Prywatny czat jest dostępny po zaakceptowaniu zaproszenia do Ekipy.', status: 403 }
     }
     const message = {
@@ -877,6 +1251,15 @@ app.post('/api/chat', requireAuthentication, chatMutationLimit, async (request, 
       createdAt: Date.now(),
     }
     store.socialChatMessages.push(message)
+    if (recipient) appendSocialNotification(
+      store,
+      recipient.id,
+      request.authUser.id,
+      'chat_message',
+      'wysłał(a) Ci wiadomość.',
+      undefined,
+      defaultNickname(request.authUser),
+    )
     store.socialChatMessages = store.socialChatMessages.slice(-5000)
     return {
       message: {
@@ -926,14 +1309,56 @@ app.delete('/api/media/:mediaId', requireAuthentication, async (request, respons
 })
 
 app.get('/api/posts', requireAuthentication, async (request, response) => {
+  const beforeValue = typeof request.query.before === 'string' ? Number(request.query.before) : undefined
+  const beforeIdValue = typeof request.query.beforeId === 'string' ? Number(request.query.beforeId) : undefined
+  const limitValue = typeof request.query.limit === 'string' ? Number(request.query.limit) : 30
+  if ((beforeValue !== undefined && (!Number.isSafeInteger(beforeValue) || beforeValue < 0))
+    || (beforeIdValue !== undefined && (!Number.isSafeInteger(beforeIdValue) || beforeIdValue < 0))
+    || !Number.isInteger(limitValue) || limitValue < 1 || limitValue > 50) {
+    return response.status(400).json({ error: 'Nieprawidłowe parametry stronicowania tablicy.' })
+  }
   response.set('Cache-Control', 'no-store')
-  return response.json({ posts: await readSocialPosts(request.authUser.id, request.authStore) })
+  const posts = await readSocialPosts(request.authUser.id, request.authStore, { before: beforeValue, beforeId: beforeIdValue, limit: limitValue + 1 })
+  const hasMore = posts.length > limitValue
+  const page = posts.slice(0, limitValue)
+  const last = page.at(-1)
+  return response.json({ posts: page, hasMore, nextCursor: hasMore && last ? { before: Number(last.createdAt ?? last.id), beforeId: last.id } : null })
+})
+
+app.get('/api/posts/:postId', requireAuthentication, async (request, response) => {
+  if (!/^\d+$/.test(request.params.postId)) return response.status(400).json({ error: 'Nieprawidłowy identyfikator posta.' })
+  const store = request.authStore
+  let post
+  if (database) {
+    const { rows } = await database.query(
+      'SELECT id, author_id, data, liked_by, saved_by, boosted_by, created_at FROM youtopic_social_posts WHERE id = $1',
+      [request.params.postId],
+    )
+    const row = rows[0]
+    if (row) post = { id: row.id, createdAt: Number(row.created_at), authorId: row.author_id, data: row.data, comments: row.data.comments ?? [], likedBy: row.liked_by, savedBy: row.saved_by, boostedBy: row.boosted_by }
+  } else {
+    post = store.socialPosts.find((item) => String(item.id) === request.params.postId)
+  }
+  if (!post || blockedUserIds(store, request.authUser.id).includes(post.authorId)
+    || !canViewSocialProfile(store, request.authUser.id, store.users.find((user) => user.id === post.authorId))
+    || post.data.bandId && !bandForMember(store, post.data.bandId, request.authUser.id)) {
+    return response.status(404).json({ error: 'Nie znaleziono dostępnego posta.' })
+  }
+  return response.json({ post: socialPostForUser(post, request.authUser.id, store.users) })
 })
 
 app.post('/api/posts', requireAuthentication, postCreationLimit, async (request, response) => {
   const { topic, text, imageMediaId, videoMediaId, externalUrl } = request.body ?? {}
   const bandId = typeof request.body?.bandId === 'string' ? request.body.bandId : ''
   const sharedPostId = typeof request.body?.sharedPostId === 'string' ? request.body.sharedPostId : ''
+  const profileTargetUserIdValue = request.body?.profileTargetUserId
+  if (profileTargetUserIdValue !== undefined && typeof profileTargetUserIdValue !== 'string') return response.status(400).json({ error: 'Nieprawidłowy profil do polecenia.' })
+  const profileTargetUserId = typeof profileTargetUserIdValue === 'string' ? profileTargetUserIdValue : ''
+  if (profileTargetUserId && (bandId || sharedPostId)) return response.status(400).json({ error: 'Polecenie profilu można opublikować tylko na publicznej tablicy.' })
+  const profileTarget = profileTargetUserId
+    ? request.authStore.users.find((user) => user.id === profileTargetUserId && user.emailVerified === true && !isUserBlocked(user))
+    : null
+  if (profileTargetUserId && (!profileTarget || profileTarget.id === request.authUser.id)) return response.status(404).json({ error: 'Nie znaleziono aktywnego profilu do polecenia.' })
   let sharedSource = null
   if (bandId && !bandForMember(request.authStore, bandId, request.authUser.id)) return response.status(403).json({ error: 'Nie należysz do tej bandy.' })
   if (sharedPostId && bandId) {
@@ -976,6 +1401,7 @@ app.post('/api/posts', requireAuthentication, postCreationLimit, async (request,
     image: sharedSource?.data.image ?? (imageMediaId ? `/api/media/${imageMediaId}` : undefined),
     video: sharedSource?.data.video ?? (videoMediaId ? `/api/media/${videoMediaId}` : undefined),
     externalUrl: normalizedUrl,
+    profileTarget: profileTarget ? publicSocialPerson(profileTarget) : undefined,
     comments: [],
     boosts: 0,
     bandId: bandId || undefined,
@@ -985,13 +1411,13 @@ app.post('/api/posts', requireAuthentication, postCreationLimit, async (request,
     const { rows } = await database.query(
       `INSERT INTO youtopic_social_posts (author_id, data, band_id, created_at)
        VALUES ($1, $2::jsonb, $3, $4)
-       RETURNING id, author_id, data, liked_by, saved_by, boosted_by`,
+       RETURNING id, author_id, data, liked_by, saved_by, boosted_by, created_at`,
       [request.authUser.id, JSON.stringify(postData), bandId || null, now],
     )
-    return response.status(201).json({ post: socialPostForUser({ ...rows[0], comments: rows[0].data.comments ?? [] }, request.authUser.id, (await readStore()).users) })
+    return response.status(201).json({ post: socialPostForUser({ ...rows[0], createdAt: Number(rows[0].created_at), comments: rows[0].data.comments ?? [] }, request.authUser.id, (await readStore()).users) })
   }
   const post = await updateStore((store) => {
-    const created = { id: Date.now(), authorId: request.authUser.id, author, data: postData, comments: [], likedBy: [], savedBy: [], boostedBy: [] }
+    const created = { id: Date.now(), createdAt: now, authorId: request.authUser.id, author, data: postData, comments: [], likedBy: [], savedBy: [], boostedBy: [] }
     store.socialPosts.unshift(created)
     return socialPostForUser(created, request.authUser.id, store.users)
   })
@@ -1005,17 +1431,22 @@ async function mutateSocialPost(postId, userId, mutate) {
     const client = await database.connect()
     try {
       await client.query('BEGIN')
-      const { rows } = await client.query('SELECT id, author_id, data, liked_by, saved_by, boosted_by, band_id FROM youtopic_social_posts WHERE id = $1 FOR UPDATE', [postId])
+      const { rows } = await client.query('SELECT id, author_id, data, liked_by, saved_by, boosted_by, band_id, created_at FROM youtopic_social_posts WHERE id = $1 FOR UPDATE', [postId])
       if (!rows[0]) {
         await client.query('ROLLBACK')
         return null
       }
       const row = rows[0]
+      if (isSocialBlocked(store, userId, row.author_id)
+        || !canViewSocialProfile(store, userId, store.users.find((user) => user.id === row.author_id))) {
+        await client.query('ROLLBACK')
+        return null
+      }
       if (row.band_id && !bandForMember(store, row.band_id, userId)) {
         await client.query('ROLLBACK')
         return null
       }
-      const post = { id: row.id, authorId: row.author_id, data: row.data, comments: row.data.comments ?? [], likedBy: row.liked_by, savedBy: row.saved_by, boostedBy: row.boosted_by }
+      const post = { id: row.id, createdAt: Number(row.created_at), authorId: row.author_id, data: row.data, comments: row.data.comments ?? [], likedBy: row.liked_by, savedBy: row.saved_by, boostedBy: row.boosted_by }
       const result = await mutate(post, client)
       if (result?.error) {
         await client.query('ROLLBACK')
@@ -1034,7 +1465,9 @@ async function mutateSocialPost(postId, userId, mutate) {
   }
   return updateStore(async (store) => {
     const item = store.socialPosts.find((entry) => String(entry.id) === postId)
-    if (!item || item.data.bandId && !bandForMember(store, item.data.bandId, userId)) return null
+    if (!item || isSocialBlocked(store, userId, item.authorId)
+      || !canViewSocialProfile(store, userId, store.users.find((user) => user.id === item.authorId))
+      || item.data.bandId && !bandForMember(store, item.data.bandId, userId)) return null
     const result = await mutate(item, null)
     if (result?.error) return { error: result.error }
     item.data.comments = item.comments
@@ -1076,6 +1509,12 @@ app.post('/api/posts/:postId/boost', requireAuthentication, async (request, resp
     post.data.boosts = Number(post.data.boosts ?? 0) + 1
     return post.authorId === request.authUser.id ? undefined : { notification: { userId: post.authorId, type: 'boost', message: 'podbił Twój post.' } }
   }
+}))
+
+app.post('/api/posts/:postId/pin', requireAuthentication, async (request, response) => socialPostResponse(request.params.postId, request.authUser.id, response, (post) => {
+  const band = post.data.bandId ? bandForMember(request.authStore, post.data.bandId, request.authUser.id) : null
+  if (!band || band.adminId !== request.authUser.id) return { error: 'Tylko administrator bandy może przypinać posty.' }
+  post.data.pinnedAt = post.data.pinnedAt ? undefined : Date.now()
 }))
 
 app.post('/api/posts/:postId/comments', requireAuthentication, async (request, response) => {
@@ -1141,6 +1580,8 @@ function permissionsForAdmin(admin) {
   if (permissions.has('support.manage')) permissions.add('support.view')
   if (permissions.has('settings.manage')) permissions.add('settings.view')
   if (permissions.has('content.manage')) permissions.add('content.view')
+  if (permissions.has('gallery.photos.delete')) permissions.add('gallery.view')
+  if (permissions.has('gallery.view')) permissions.add('users.view')
   return [...permissions]
 }
 
@@ -1455,6 +1896,113 @@ app.get('/api/admin/users', requireAdminAuthentication, requireAdminPermission('
   })
 })
 
+app.get('/api/admin/gallery/users/:userId', requireAdminAuthentication, requireAdminPermission('gallery.view'), async (request, response) => {
+  const store = await readStore()
+  const owner = store.users.find((user) => user.id === request.params.userId && user.emailVerified === true)
+  if (!owner) return response.status(404).json({ error: 'Nie znaleziono aktywnego profilu.' })
+  let sourcePosts
+  if (database) {
+    const { rows } = await database.query(
+      `SELECT id, data, created_at FROM youtopic_social_posts
+       WHERE author_id = $1 AND band_id IS NULL AND data ? 'image'
+       ORDER BY created_at DESC, id DESC LIMIT 500`,
+      [owner.id],
+    )
+    sourcePosts = rows.map((row) => ({ id: row.id, data: row.data, createdAt: Number(row.created_at) }))
+  } else {
+    sourcePosts = store.socialPosts
+      .filter((post) => post.authorId === owner.id && !post.data.bandId && typeof post.data.image === 'string')
+      .sort((first, second) => Number(second.createdAt ?? second.id) - Number(first.createdAt ?? first.id))
+      .slice(0, 500)
+  }
+  const albums = store.socialAlbums
+    .filter((album) => album.ownerId === owner.id)
+    .map(({ id, name, createdAt, photos }) => ({
+      id,
+      name,
+      createdAt,
+      photos: photos.filter((photo) => !photo.sourcePostId || !isGalleryPhotoModerated(store, owner.id, photo.sourcePostId)),
+    }))
+  return response.json({
+    photos: sourcePosts.filter((post) => !isGalleryPhotoModerated(store, owner.id, post.id)).map(galleryPostPhoto),
+    albums,
+    owner: { id: owner.id, name: [owner.firstName, owner.middleName, owner.lastName, owner.secondLastName].filter(Boolean).join(' '), nickname: defaultProfileNickname(owner) },
+  })
+})
+
+app.get('/api/admin/gallery/media/:mediaId', requireAdminAuthentication, requireAdminPermission('gallery.view'), async (request, response) => {
+  if (!/^[\da-f-]{36}$/i.test(request.params.mediaId)) return response.status(404).json({ error: 'Nie znaleziono zdjęcia.' })
+  let media
+  if (database) {
+    const { rows } = await database.query('SELECT content_type, data FROM youtopic_social_media WHERE id = $1', [request.params.mediaId])
+    media = rows[0]
+  } else {
+    const item = (await readStore()).socialMedia.find((photo) => photo.id === request.params.mediaId)
+    if (item) media = { content_type: item.contentType, data: Buffer.from(item.data, 'base64') }
+  }
+  if (!media || !media.content_type.startsWith('image/')) return response.status(404).json({ error: 'Nie znaleziono zdjęcia.' })
+  response.set({ 'Content-Type': media.content_type, 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff' })
+  return response.send(media.data)
+})
+
+app.delete('/api/admin/gallery/users/:userId/posts/:postId/photo', requireAdminAuthentication, requireAdminPermission('gallery.photos.delete'), adminMutationLimit, async (request, response) => {
+  if (!/^\d+$/.test(request.params.postId)) return response.status(400).json({ error: 'Nieprawidłowy identyfikator posta.' })
+  let removed = false
+  let removedMediaId = ''
+  if (database) {
+    const { rows } = await database.query(
+      'SELECT author_id, data FROM youtopic_social_posts WHERE id = $1 AND author_id = $2',
+      [request.params.postId, request.params.userId],
+    )
+    const post = rows[0]
+    if (!post || !post.data.image) return response.status(404).json({ error: 'Nie znaleziono zdjęcia na Tablicy.' })
+    removedMediaId = /^\/api\/media\/([\da-f-]{36})$/i.exec(post.data.image)?.[1] ?? ''
+    const updatedData = { ...post.data }
+    delete updatedData.image
+    if (!updatedData.text && !updatedData.video && !updatedData.externalUrl && !updatedData.sharedFrom) {
+      await database.query('DELETE FROM youtopic_social_posts WHERE id = $1 AND author_id = $2', [request.params.postId, request.params.userId])
+    } else {
+      await database.query('UPDATE youtopic_social_posts SET data = $1::jsonb WHERE id = $2 AND author_id = $3', [JSON.stringify(updatedData), request.params.postId, request.params.userId])
+    }
+    removed = true
+    await updateStore((store) => store.socialAlbums.forEach((album) => {
+      album.photos = album.photos.filter((photo) => photo.sourcePostId !== request.params.postId)
+    }))
+  } else {
+    removed = await updateStore((store) => {
+      const post = store.socialPosts.find((item) => String(item.id) === request.params.postId
+        && item.authorId === request.params.userId && item.data.image)
+      if (!post) return false
+      removedMediaId = /^\/api\/media\/([\da-f-]{36})$/i.exec(post.data.image)?.[1] ?? ''
+      delete post.data.image
+      store.socialAlbums.forEach((album) => {
+        album.photos = album.photos.filter((photo) => photo.sourcePostId !== request.params.postId)
+      })
+      if (!post.data.text && !post.data.video && !post.data.externalUrl && !post.data.sharedFrom) {
+        store.socialPosts = store.socialPosts.filter((item) => item !== post)
+      }
+      return true
+    })
+  }
+  if (!removed) return response.status(404).json({ error: 'Nie znaleziono zdjęcia na Tablicy.' })
+  await deleteUnreferencedMedia(removedMediaId)
+  return response.json({ ok: true })
+})
+
+app.delete('/api/admin/gallery/users/:userId/albums/:albumId/photos/:photoId', requireAdminAuthentication, requireAdminPermission('gallery.photos.delete'), adminMutationLimit, async (request, response) => {
+  const removal = await updateStore((store) => {
+    const album = store.socialAlbums.find((item) => item.id === request.params.albumId && item.ownerId === request.params.userId)
+    if (!album) return null
+    const photo = album.photos.find((item) => item.id === request.params.photoId)
+    if (!photo) return null
+    album.photos = album.photos.filter((photo) => photo.id !== request.params.photoId)
+    return { mediaId: photo.mediaId ?? '' }
+  })
+  if (!removal) return response.status(404).json({ error: 'Nie znaleziono zdjęcia w albumie.' })
+  await deleteUnreferencedMedia(removal.mediaId)
+  return response.json({ ok: true })
+})
+
 app.patch('/api/admin/users/:id/block', requireAdminAuthentication, requireAdminPermission('users.block'), adminMutationLimit, async (request, response) => {
   const { blocked, reason, durationDays = 7, blockIp = false } = request.body ?? {}
   if (typeof blocked !== 'boolean') return response.status(400).json({ error: 'Nieprawidłowa wartość blokady.' })
@@ -1583,34 +2131,67 @@ app.post('/api/users/:id/reports', requireAuthentication, authRateLimit, async (
 })
 
 app.post('/api/reports', requireAuthentication, authRateLimit, async (request, response) => {
-  const { targetType, targetId, targetUserId, reason, contentPreview = '', contentUrl = '' } = request.body ?? {}
+  const { targetType, targetId, targetUserId, reason, contentPreview = '', contentUrl = '', reasonCategory = 'other' } = request.body ?? {}
   const allowedTypes = new Set(['profile', 'post', 'photo', 'video', 'comment', 'message'])
   if (typeof targetType !== 'string' || !allowedTypes.has(targetType)) return response.status(400).json({ error: 'Nieprawidłowy rodzaj zgłoszenia.' })
   if (typeof targetId !== 'string' || !targetId.trim() || targetId.length > 200) return response.status(400).json({ error: 'Nieprawidłowy identyfikator zgłaszanej treści.' })
   if (typeof targetUserId !== 'string' || !targetUserId || targetUserId === request.authUser.id) return response.status(400).json({ error: 'Nie można zgłosić własnego konta ani treści.' })
-  if (typeof reason !== 'string' || !reason.trim() || reason.trim().length > 500) return response.status(400).json({ error: 'Podaj powód zgłoszenia (maksymalnie 500 znaków).' })
+  if (typeof reasonCategory !== 'string' || !reportCategoryLabels.has(reasonCategory)) return response.status(400).json({ error: 'Wybierz prawidłową kategorię zgłoszenia.' })
+  if (typeof reason !== 'string' || reason.trim().length > 500) return response.status(400).json({ error: 'Dodatkowe wyjaśnienie może mieć maksymalnie 500 znaków.' })
   if (typeof contentPreview !== 'string' || contentPreview.length > 1000) return response.status(400).json({ error: 'Podgląd zgłaszanej treści jest zbyt długi.' })
   if (typeof contentUrl !== 'string' || contentUrl.length > 2048) return response.status(400).json({ error: 'Nieprawidłowy adres zgłaszanej treści.' })
-  if (contentUrl) {
-    try {
-      if (!['http:', 'https:'].includes(new URL(contentUrl).protocol)) throw new Error('Invalid protocol')
-    } catch {
-      return response.status(400).json({ error: 'Adres zgłaszanej treści musi zaczynać się od http:// lub https://.' })
-    }
-  }
-  const result = await updateStore((store) => {
-    if (!store.users.some((user) => user.id === targetUserId)) return { error: 'Nie znaleziono konta autora zgłaszanej treści.', status: 404 }
+  const result = await updateStore(async (store) => {
+    const target = store.users.find((user) => user.id === targetUserId)
+    if (!target) return { error: 'Nie znaleziono konta autora zgłaszanej treści.', status: 404 }
     if (store.reports.some((report) => report.reporterId === request.authUser.id && report.targetType === targetType && report.targetId === targetId && report.status === 'pending')) {
       return { error: 'To zgłoszenie już czeka na weryfikację.', status: 409 }
     }
+    let snapshot = contentPreview.trim()
+    let mediaId = ''
+    const mediaMatch = /^\/?api\/media\/([\da-f-]{36})$/i.exec(contentUrl)
+      ?? /^https?:\/\/[^/]+\/api\/media\/([\da-f-]{36})$/i.exec(contentUrl)
+    if (targetType === 'profile') {
+      if (targetId !== `profile:${targetUserId}`) return { error: 'Nieprawidłowy identyfikator profilu.', status: 400 }
+      snapshot = [target.bio, snapshot].filter(Boolean).join('\n\n').slice(0, 1000)
+    } else if (['post', 'photo', 'video', 'comment'].includes(targetType)) {
+      const match = /^(?:post|photo|video|comment):(\d+)(?::(\d+))?$/.exec(targetId)
+      if (!match) return { error: 'Nie znaleziono zgłaszanej treści.', status: 404 }
+      const post = database
+        ? await database.query('SELECT id, author_id AS "authorId", data FROM youtopic_social_posts WHERE id = $1 AND author_id = $2', [match[1], targetUserId]).then(({ rows }) => rows[0])
+        : store.socialPosts.find((item) => String(item.id) === match[1] && item.authorId === targetUserId)
+      if (!post) return { error: 'Nie znaleziono zgłaszanego posta.', status: 404 }
+      if (post.data.bandId && !bandForMember(store, post.data.bandId, request.authUser.id)) return { error: 'Nie znaleziono zgłaszanego posta.', status: 404 }
+      if (targetType === 'comment') {
+        const comment = (post.comments ?? post.data.comments ?? []).find((item) => String(item.id) === match[2] && item.authorId === targetUserId)
+        if (!comment) return { error: 'Nie znaleziono zgłaszanego komentarza.', status: 404 }
+        snapshot = [comment.text, snapshot].filter(Boolean).join('\n\n').slice(0, 1000)
+        const commentMedia = /^\/api\/media\/([\da-f-]{36})$/i.exec(comment.audioUrl ?? '')
+        mediaId = commentMedia?.[1] ?? ''
+      } else {
+        const key = targetType === 'photo' ? 'image' : targetType === 'video' ? 'video' : null
+        const postMedia = key
+          ? /^\/api\/media\/([\da-f-]{36})$/i.exec(post.data[key] ?? '')
+          : /^\/api\/media\/([\da-f-]{36})$/i.exec(post.data.video ?? '') ?? /^\/api\/media\/([\da-f-]{36})$/i.exec(post.data.image ?? '')
+        if (key && !postMedia) return { error: 'Nie znaleziono zgłaszanego zdjęcia lub filmu.', status: 404 }
+        snapshot = [post.data.text, snapshot].filter(Boolean).join('\n\n').slice(0, 1000)
+        mediaId = postMedia?.[1] ?? ''
+      }
+    } else if (targetType === 'message') {
+      const messageId = targetId.replace(/^message:/, '')
+      const message = store.socialChatMessages.find((item) => item.id === messageId && item.authorId === targetUserId)
+      if (!message) return { error: 'Nie znaleziono zgłaszanej wiadomości.', status: 404 }
+      snapshot = [message.text, snapshot].filter(Boolean).join('\n\n').slice(0, 1000)
+    }
+    if (contentUrl && targetType !== 'profile' && (!mediaId || !mediaMatch || mediaMatch[1] !== mediaId)) return { error: 'Nie można powiązać załącznika ze zgłaszaną treścią.', status: 400 }
     const report = {
       id: crypto.randomUUID(),
       reporterId: request.authUser.id,
       targetUserId,
       targetType,
       targetId: targetId.trim(),
-      contentPreview: contentPreview.trim(),
-      contentUrl,
+      contentPreview: snapshot,
+      mediaId: mediaId || undefined,
+      reasonCategory,
       reason: reason.trim(),
       createdAt: Date.now(),
       status: 'pending',
@@ -1631,18 +2212,22 @@ app.get('/api/admin/reports', requireAdminAuthentication, requireAdminPermission
     .map((report) => {
       const reporter = usersById.get(report.reporterId)
       const target = usersById.get(report.targetUserId)
+      const decidingAdmin = store.admins.find((admin) => admin.id === report.decidedBy)
       return {
         id: report.id,
         targetType: report.targetType || 'profile',
         targetId: report.targetId || `profile:${report.targetUserId}`,
         contentPreview: report.contentPreview || '',
         contentUrl: report.contentUrl || '',
+        reasonCategory: report.reasonCategory || 'other',
+        reasonCategoryLabel: reportCategoryLabels.get(report.reasonCategory || 'other') || 'Inne',
         reason: report.reason,
         createdAt: report.createdAt,
         status: report.status === 'pending' ? 'pending' : 'resolved',
         decision: report.decision || null,
         decisionNote: report.decisionNote || '',
         decidedAt: report.decidedAt || null,
+        decidedBy: report.decidedByName || decidingAdmin?.name || null,
         reporter: reporter ? {
           id: reporter.id,
           name: [reporter.firstName, reporter.middleName, reporter.lastName, reporter.secondLastName].filter(Boolean).join(' '),
@@ -1692,6 +2277,7 @@ app.patch('/api/admin/reports/:id/decision', requireAdminAuthentication, require
     report.decisionNote = note.trim()
     report.decidedAt = now
     report.decidedBy = request.adminUser.id
+    report.decidedByName = request.adminUser.name
     const decisionLabels = {
       dismiss: 'Zgłoszenie zostało sprawdzone i odrzucone.',
       remove_content: 'Zgłoszona treść została usunięta przez moderację.',
@@ -2313,7 +2899,7 @@ app.post('/api/account/email-change/verify', requireAuthentication, authRateLimi
 })
 
 app.post('/api/profile', requireAuthentication, async (request, response) => {
-  const { nickname, firstName, middleName, lastName, secondLastName, location, contactPhone, secondContactPhone, bio, avatar, coverImage, socialLinks, profileVisibility } = request.body ?? {}
+  const { nickname, firstName, middleName, lastName, secondLastName, location, contactPhone, secondContactPhone, bio, avatar, coverImage, socialLinks, profileVisibility, socialPrivacy } = request.body ?? {}
   const normalizedNickname = typeof nickname === 'string' ? nickname.trim().replace(/^@/, '') : ''
   if (!/^[\p{L}\p{N}._-]{2,24}$/u.test(normalizedNickname)) return response.status(400).json({ error: 'Nick musi mieć od 2 do 24 znaków: litery, cyfry, kropki, myślniki lub podkreślenia.' })
   if (typeof firstName !== 'string' || !firstName.trim() || firstName.trim().length > 80 || typeof lastName !== 'string' || !lastName.trim() || lastName.trim().length > 80) return response.status(400).json({ error: 'Imię i nazwisko są wymagane i mogą mieć maksymalnie 80 znaków.' })
@@ -2344,6 +2930,11 @@ app.post('/api/profile', requireAuthentication, async (request, response) => {
   }
   const visibilityFields = ['location', 'bio', 'contactPhone', 'secondContactPhone', 'socialLinks', 'crewMembers', 'crewSize']
   if (!profileVisibility || typeof profileVisibility !== 'object' || Array.isArray(profileVisibility) || visibilityFields.some((field) => !profileAudiences.has(profileVisibility[field]))) return response.status(400).json({ error: 'Wybierz widoczność dla każdego dodatkowego pola profilu.' })
+  if (!socialPrivacy || typeof socialPrivacy !== 'object' || Array.isArray(socialPrivacy)
+    || !['public', 'crew', 'private'].includes(socialPrivacy.profileAudience)
+    || !['everyone', 'nobody'].includes(socialPrivacy.crewInviteAudience)) {
+    return response.status(400).json({ error: 'Wybierz widoczność profilu i zasady zaproszeń do Ekipy.' })
+  }
   const result = await updateStore((store) => {
     const duplicate = store.users.some((user) => user.id !== request.authUser.id && defaultProfileNickname(user).toLocaleLowerCase('pl-PL') === normalizedNickname.toLocaleLowerCase('pl-PL'))
     if (duplicate) return { error: 'Ten nick jest już zajęty.' }
@@ -2363,6 +2954,7 @@ app.post('/api/profile', requireAuthentication, async (request, response) => {
       coverImage,
       socialLinks: normalizedSocialLinks,
       profileVisibility,
+      socialPrivacy,
     })
     return { user: safeUser(user) }
   })
